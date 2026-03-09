@@ -88,11 +88,17 @@ if [ "$RUNTIME" = "podman" ] && [ "$OS" = "Darwin" ]; then
   if [ -f "$SCRIPT_DIR/package.json" ] && [ -d "$SCRIPT_DIR/node_modules" ]; then
     # Running from cloned repo with deps installed
     APP_DIR="$SCRIPT_DIR"
+    if [ ! -f "$APP_DIR/dist/server/index.js" ]; then
+      info "Building project..."
+      (cd "$APP_DIR" && npm run build)
+    fi
   elif [ -f "$SCRIPT_DIR/package.json" ] && [ ! -d "$SCRIPT_DIR/node_modules" ]; then
-    # Running from cloned repo, need to install deps
+    # Running from cloned repo, need to install deps and build
     APP_DIR="$SCRIPT_DIR"
     info "Installing dependencies..."
     (cd "$APP_DIR" && npm install)
+    info "Building project..."
+    (cd "$APP_DIR" && npm run build)
   else
     # Standalone run.sh — extract from container image
     if [ ! -f "$APP_DIR/dist/server/index.js" ]; then
