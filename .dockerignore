@@ -1,0 +1,29 @@
+# Dependencies (rebuilt in container)
+node_modules/
+
+# Build output (rebuilt in container)
+dist/
+
+# Git
+.git/
+.gitignore
+
+# Sensitive data
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+
+# User state
+.openclaw-installer/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
