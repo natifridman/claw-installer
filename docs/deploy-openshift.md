@@ -40,8 +40,8 @@ Open `http://localhost:3000`, pick **Kubernetes**, fill in the form, and hit Dep
 
 | Field | Example | Notes |
 |-------|---------|-------|
-| **Namespace prefix** | `alice` | Combined with agent name: `alice-myagent-openclaw` |
 | **Agent name** | `myagent` | ID for your default agent |
+| **Owner prefix** | *(optional)* | Defaults to OS username. Combined with agent name: `alice-myagent-openclaw` |
 | **Display name** | `My Agent` | Shown in the UI |
 | **Image** | `quay.io/sallyom/openclaw:latest` | Container image |
 | **API key** | *(your key)* | For Anthropic, OpenAI, or other providers |

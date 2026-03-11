@@ -33,7 +33,7 @@ Open `http://localhost:3000`, pick **"This Machine"**, fill in the form, and hit
 ## Deploy Form
 
 1. Pick **"This Machine"**
-2. Fill in a **name prefix** (e.g., `alice`) and **agent name** (e.g., `myagent`)
+2. Fill in an **agent name** (e.g., `myagent`) and optionally an **owner prefix** (defaults to your OS username)
 3. Add your API key if not already detected from the environment
 4. For Vertex AI: upload your GCP service account JSON or provide an absolute path
 5. Hit **Deploy OpenClaw**
