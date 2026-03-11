@@ -106,7 +106,7 @@ function deriveModel(config: DeployConfig): string {
   if (config.vertexEnabled) {
     return config.vertexProvider === "anthropic"
       ? "anthropic-vertex/claude-sonnet-4-6"
-      : "google-vertex/gemini-2.5-pro";
+      : "google-vertex/gemini-3.1-pro";
   }
   if (config.openaiApiKey) return "openai/gpt-5";
   if (config.modelEndpoint) return "openai/default";

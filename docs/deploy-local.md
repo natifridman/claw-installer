@@ -1,0 +1,182 @@
+# Deploying OpenClaw Locally (podman / docker)
+
+The local deployer runs OpenClaw as a single container on your machine. It works on macOS and Linux with podman or docker.
+
+## Quick Start
+
+### No git clone required (Linux)
+
+On Linux with podman or docker, you can run the installer directly from its container image:
+
+```bash
+curl -fsSLo run.sh https://raw.githubusercontent.com/sallyom/claw-installer/main/run.sh
+chmod +x run.sh
+./run.sh
+```
+
+The script pulls the installer image, starts it as a container with your podman (or docker) socket mounted, and opens the UI at `http://localhost:3000`. No clone, no Node.js, no build step.
+
+On macOS with podman, the script extracts the app from the image and runs it natively with Node.js (`brew install node` required).
+
+### From source
+
+```bash
+git clone https://github.com/sallyom/claw-installer.git
+cd claw-installer
+npm install && npm run build && npm run dev
+```
+
+Open `http://localhost:3000`, pick **"This Machine"**, fill in the form, and hit Deploy.
+
+**Requirements:** podman or docker. On macOS with podman, Node.js is also needed (`brew install node`).
+
+## Deploy Form
+
+1. Pick **"This Machine"**
+2. Fill in a **name prefix** (e.g., `alice`) and **agent name** (e.g., `myagent`)
+3. Add your API key if not already detected from the environment
+4. For Vertex AI: upload your GCP service account JSON or provide an absolute path
+5. Hit **Deploy OpenClaw**
+6. Go to the **Instances** tab to manage your deployment — copy the gateway token, view the run command, open the UI, stop/start the container, or delete the data volume
+
+The installer pulls the image, provisions your agent with a default identity and security guidelines, starts the container, and streams logs in real time. Your OpenClaw instance will be running at `http://localhost:18789`.
+
+## What the Installer Does
+
+### Container setup
+
+The installer runs a podman (or docker) container with:
+
+- `-p <port>:18789` — port mapping (works on macOS and Linux)
+- `--bind lan` — gateway listens on `0.0.0.0` (required for port mapping)
+- Labels: `openclaw.managed=true`, `openclaw.prefix=<prefix>`, `openclaw.agent=<name>`
+- Volume: `openclaw-<prefix>-data` at `/home/node/.openclaw`
+
+### Init script
+
+Before starting the gateway, the installer runs an init script inside the container that:
+
+1. Creates workspace directories (`workspace`, `skills`, `cron`, `workspace-<agentId>`)
+2. Writes `openclaw.json` configuration to the data volume
+3. Copies agent workspace files (`AGENTS.md`, `SOUL.md`, etc.) to the agent workspace
+4. Sets permissions for the `node` user
+
+### GCP credentials (Vertex AI)
+
+When you provide a GCP service account JSON, the installer:
+
+1. Base64-encodes the JSON
+2. Runs a separate `podman run --rm` step (after the init script) to decode and write it to the data volume at `/home/node/.openclaw/gcp/sa.json`
+3. Sets `GOOGLE_APPLICATION_CREDENTIALS=/home/node/.openclaw/gcp/sa.json` on the main container
+4. Auto-extracts the `project_id` from the JSON for `GOOGLE_CLOUD_PROJECT`
+
+The SA JSON is written to the podman volume, not bind-mounted, to avoid UID mismatch permission issues between the host user and the container's `node` user.
+
+## Launcher Script
+
+`run.sh` abstracts platform-specific container plumbing:
+
+```bash
+./run.sh                              # Pull image and start
+./run.sh --build                      # Build from source instead of pulling
+./run.sh --port 8080                  # Custom port (default: 3000)
+./run.sh --runtime docker             # Force docker (default: auto-detect)
+ANTHROPIC_API_KEY=sk-... ./run.sh     # Anthropic
+OPENAI_API_KEY=sk-... ./run.sh        # OpenAI
+```
+
+| Platform | Runtime | What the script does |
+|----------|---------|---------------------|
+| macOS | podman | Extracts app from image, runs natively with Node.js |
+| macOS | docker | Runs as a container with Docker socket |
+| Linux | podman | Runs as a container with rootless podman socket |
+| Linux | docker | Runs as a container with `/var/run/docker.sock` |
+
+To stop: `Ctrl+C` (macOS/podman) or `podman stop claw-installer` / `docker stop claw-installer`.
+
+### Manual container setup
+
+If `run.sh` doesn't work for your setup:
+
+```bash
+# Linux (podman)
+podman run -d --name claw-installer \
+  --security-opt label=disable \
+  -p 3000:3000 \
+  -v /run/user/$(id -u)/podman/podman.sock:/run/podman/podman.sock \
+  -v ~/.openclaw-installer:/home/node/.openclaw-installer:Z \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  quay.io/sallyom/claw-installer:latest
+
+# Docker (any platform)
+docker run -d --name claw-installer \
+  -p 3000:3000 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/.openclaw-installer:/home/node/.openclaw-installer \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  quay.io/sallyom/claw-installer:latest
+
+# macOS with podman (run from source — socket forwarding not supported)
+git clone https://github.com/sallyom/claw-installer.git
+cd claw-installer && npm install && npm run dev
+```
+
+## Remote Access
+
+Running the installer on a remote machine:
+
+```bash
+# On the remote machine
+ANTHROPIC_API_KEY=sk-... ./run.sh --build
+
+# On your laptop
+ssh -L 3000:localhost:3000 user@remote-host
+# Open http://localhost:3000
+```
+
+## Instance Management
+
+The **Instances** tab discovers all OpenClaw containers via labels and image name. For each instance you can:
+
+- **Copy gateway token** — needed to authenticate with the Control UI
+- **View run command** — the exact `podman run` command used
+- **Open UI** — link to `http://localhost:<port>`
+- **Stop** — stops and removes the container (volume preserved)
+- **Start** — restarts the container
+- **Delete data** — removes the podman volume
+
+## Host Filesystem
+
+```
+~/.openclaw-installer/
+├── agents/                                  # Agent source files (mounted on deploy)
+│   ├── workspace-<prefix>_<name>/
+│   │   ├── AGENTS.md
+│   │   ├── agent.json
+│   │   ├── SOUL.md
+│   │   ├── IDENTITY.md
+│   │   ├── TOOLS.md
+│   │   ├── USER.md
+│   │   ├── HEARTBEAT.md
+│   │   └── MEMORY.md
+│   └── skills/
+│       └── <skill-name>/
+│           └── SKILL.md
+└── openclaw-<prefix>-<name>/                # Per-instance config (auto-saved)
+    ├── .env                                 # Instance variables
+    └── gateway-token                        # Gateway auth token
+```
+
+Edit files in `agents/workspace-<id>/` and re-deploy to customize your agent. The installer uses your local files when they exist, falling back to generated defaults for anything missing.
+
+## Environment Variables
+
+Pass these to `run.sh` or `npm run dev` to set server-side defaults (users can leave corresponding form fields blank):
+
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `MODEL_ENDPOINT` | OpenAI-compatible endpoint for self-hosted models |
+| `OPENCLAW_IMAGE` | Default container image |
+| `OPENCLAW_PREFIX` | Default name prefix |

@@ -1,172 +1,78 @@
 # OpenClaw Installer
 
-> **WIP -  The local deployer works great. K8s and SSH modes are not yet implemented.**
+Deploy [OpenClaw](https://github.com/openclaw) from your browser — to OpenShift, Kubernetes, or local podman.
 
-Deploy [OpenClaw](https://github.com/openclaw) from your browser. One script, one command, one click.
+### No git clone required
 
-## Quick Start
+On Linux, you can run the installer directly from its container image — no clone, no Node.js, no build step. Just podman (or docker) and a single script:
 
 ```bash
 curl -fsSLo run.sh https://raw.githubusercontent.com/sallyom/claw-installer/main/run.sh
 chmod +x run.sh
-
-export ANTHROPIC_API_KEY=sk-...   # or OPENAI_API_KEY=sk-...
 ./run.sh
 ```
 
-That's it. The script detects your platform, pulls what it needs, and starts the installer. Open http://localhost:3000 in your browser.
+The script pulls the installer image, starts it as a container (with your podman or docker socket mounted), and opens the UI at `http://localhost:3000`. On macOS with podman, it extracts the app from the image and runs it natively with Node.js.
 
-**Requirements:** podman or docker. On macOS with podman, Node.js is also needed (`brew install node`).
-
-### Alternative: clone and run
+### From source
 
 ```bash
 git clone https://github.com/sallyom/claw-installer.git
 cd claw-installer
-./run.sh                    # or: npm install && npm run dev
+npm install && npm run build && npm run dev
 ```
 
-### Then what?
+Open `http://localhost:3000`, pick your deploy target, fill in the form, and click Deploy.
 
-1. Open the installer in your browser
-2. Pick **"This Machine"**
-3. Fill in a **name prefix** (e.g., `sally`) and **agent name** (e.g., `lynx`)
-4. Add your API key if not already detected from the environment
-5. Hit **Deploy OpenClaw**
-6. Go to the **Instances** tab to manage your deployment — copy the gateway token, view the run command, open the UI, stop/start the container, or delete the data volume
+## Deploy Targets
 
-The installer pulls the image, provisions your agent with a default identity and security guidelines, starts the container, and streams logs in real time. Your OpenClaw instance will be running at `http://localhost:18789`.
+| Target | Guide | What it does |
+|--------|-------|-------------|
+| **OpenShift / Kubernetes** | [deploy-openshift.md](docs/deploy-openshift.md) | Creates namespace, PVC, ConfigMaps, Secrets, Service, Deployment via K8s API. On OpenShift, adds OAuth proxy sidecar for SSO — no cluster-admin required. |
+| **Local (podman / docker)** | [deploy-local.md](docs/deploy-local.md) | Pulls the image, provisions your agent, starts a container on localhost. Works on macOS and Linux. |
 
-## What You Get
+## Why not Helm or kustomize?
 
-Every deploy creates a fully configured OpenClaw instance with:
+OpenClaw is a single-container deployment (plus an oauth-proxy sidecar on OpenShift). The Kubernetes resources are straightforward — the real complexity is in the *content* the installer generates and manages:
 
-- A registered agent in `openclaw.json` with the right model for your provider
-- Workspace files (`AGENTS.md`, `agent.json`) with identity, security rules, and style guidelines
-- Skills directory watching enabled
-- Gateway configured for local access (no device pairing needed)
+- **Agent workspace files** — `AGENTS.md`, `SOUL.md`, `IDENTITY.md`, and other markdown files that define the agent's personality, security rules, and operational behavior. These get packed into a ConfigMap and copied to the PVC by the init container.
+- **`openclaw.json` configuration** — generated from the deploy form with gateway settings, model selection, agent definitions, and (on OpenShift) the Route URL for `allowedOrigins`.
+- **Subagents, jobs, and skills** (coming soon) — markdown files and JSON that need to be woven into the OpenClaw config, not separate Kubernetes resources. A Helm values file can't express "add this SKILL.md to the agent workspace and register it in the gateway config."
 
-## Launcher Script
+The installer builds every Kubernetes resource as a TypeScript object and applies it via the `@kubernetes/client-node` SDK. The deploy form, the resource definitions, and the agent provisioning logic all live in the same codebase. Adding a new skill or subagent means updating the config and workspace files together — something a template engine can't coordinate.
 
-`run.sh` abstracts all the platform-specific container plumbing:
+For the ~10 Kubernetes resources involved, this is simpler than maintaining a chart with `values.yaml`, templates, and a separate release lifecycle. The tradeoff is that you need the installer to deploy rather than `helm install`, but you get a UI, real-time logs, instance management, and agent customization in return.
 
-```bash
-./run.sh                              # Pull image and start
-./run.sh --build                      # Build from source instead of pulling
-./run.sh --port 8080                  # Custom port (default: 3000)
-./run.sh --runtime docker             # Force docker (default: auto-detect)
-ANTHROPIC_API_KEY=sk-... ./run.sh     # Anthropic
-OPENAI_API_KEY=sk-... ./run.sh        # OpenAI
-```
-
-| Platform | Runtime | What the script does |
-|----------|---------|---------------------|
-| macOS | podman | Extracts app from image, runs natively with Node.js |
-| macOS | docker | Runs as a container with Docker socket |
-| Linux | podman | Runs as a container with rootless podman socket |
-| Linux | docker | Runs as a container with `/var/run/docker.sock` |
-
-To stop: `Ctrl+C` (macOS/podman) or `podman stop claw-installer` / `docker stop claw-installer`.
+See [`docs/examples/`](docs/examples/) for annotated YAMLs showing every resource the installer creates on OpenShift.
 
 ## Model Providers
 
-The installer supports multiple model providers. Set your API key and the model is auto-detected:
-
-| Provider | Default Model | API Key |
-|----------|---------------|---------|
+| Provider | Default Model | What you need |
+|----------|---------------|---------------|
 | Anthropic | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
 | OpenAI | `openai/gpt-5` | `OPENAI_API_KEY` |
-| Vertex AI (Gemini) | `google-vertex/gemini-2.5-pro` | GCP credentials |
-| Vertex AI (Claude) | `anthropic-vertex/claude-sonnet-4-6` | GCP credentials |
-| Self-hosted | `openai/default` | `MODEL_ENDPOINT` |
+| Vertex AI (Gemini) | `google-vertex/gemini-3.1-pro` | GCP service account JSON |
+| Vertex AI (Claude) | `anthropic-vertex/claude-sonnet-4-6` | GCP service account JSON |
+| Self-hosted (vLLM, etc.) | `openai/default` | `MODEL_ENDPOINT` URL |
 
-You can override the model in the deploy form. Examples:
-
-- `claude-opus-4-6`
-- `openai/gpt-5.3`
+For Vertex AI, upload your GCP service account JSON file (or provide an absolute path). The installer extracts the `project_id` automatically.
 
 ## Customizing Your Agent
 
-After the first deploy, your agent files are saved to `~/.openclaw-installer/agents/` on the host:
+After the first deploy, agent files are saved to `~/.openclaw-installer/agents/workspace-<id>/` on the host:
 
 ```
-~/.openclaw-installer/agents/
-└── workspace-sally_lynx/
-    ├── AGENTS.md      # Agent identity, instructions, security rules
-    └── agent.json     # Metadata (name, emoji, color, capabilities)
+AGENTS.md       # Agent identity, instructions, security rules
+agent.json      # Metadata (name, description, capabilities)
+SOUL.md         # Personality and communication style
+IDENTITY.md     # Who the agent is
+TOOLS.md        # Environment and tool usage notes
+USER.md         # Instance owner info
+HEARTBEAT.md    # Health check behavior
+MEMORY.md       # Learned preferences (populated over time)
 ```
 
-Edit `AGENTS.md` to change your agent's personality, instructions, or capabilities. Re-deploy to apply changes.
-
-### Adding Skills
-
-Create a skill directory with a `SKILL.md`:
-
-```
-~/.openclaw-installer/agents/
-├── workspace-sally_lynx/
-│   ├── AGENTS.md
-│   └── agent.json
-└── skills/
-    └── my-skill/
-        └── SKILL.md
-```
-
-Skills are copied into the container and loaded automatically by the gateway.
-
-## Features
-
-- **One-click deploy** — pull image, provision agent, start container
-- **Agent provisioning** — default agent with identity, security guidelines, and workspace files
-- **Custom agents and skills** — edit files on the host, re-deploy to apply
-- **Instance management** — stop, start, view token, see run command, delete data
-- **Instance discovery** — finds all OpenClaw containers via labels and image name
-- **Model selection** — explicit or auto-detected from provider config
-- **Saved configs** — `.env` and gateway token saved per instance, auto-loaded on next run
-- **.env upload** — upload a `.env` file to pre-fill the deploy form
-- **Server env fallback** — API keys from the server environment used automatically
-
-## Host Filesystem
-
-```
-~/.openclaw-installer/
-├── agents/                              # Agent source files (mounted on deploy)
-│   ├── workspace-<prefix>_<name>/
-│   │   ├── AGENTS.md
-│   │   └── agent.json
-│   └── skills/
-│       └── <skill-name>/
-│           └── SKILL.md
-├── openclaw-<prefix>-<name>/            # Per-instance config (auto-saved)
-│   ├── .env                             # Instance variables
-│   └── gateway-token                    # Gateway auth token
-└── ...
-```
-
-## Environment Variables
-
-Pass these to `run.sh` or `npm run dev` to set server-side defaults:
-
-| Variable | Purpose |
-|----------|---------|
-| `ANTHROPIC_API_KEY` | Anthropic API key (users can leave the form field blank) |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `MODEL_ENDPOINT` | OpenAI-compatible model endpoint for self-hosted models |
-| `OPENCLAW_IMAGE` | Default container image |
-| `OPENCLAW_PREFIX` | Default name prefix |
-
-## Remote Access
-
-Running the installer on a remote machine:
-
-```bash
-# On the remote machine
-ANTHROPIC_API_KEY=sk-... ./run.sh --build
-
-# On your laptop
-ssh -L 3000:localhost:3000 user@remote-host
-# Open http://localhost:3000
-```
+Edit these files and re-deploy to customize your agent's behavior. The installer uses your local files when they exist, falling back to generated defaults for anything missing.
 
 ## Architecture
 
@@ -181,50 +87,54 @@ ssh -L 3000:localhost:3000 user@remote-host
          ▼           ▼           ▼
 ┌─────────────────────────────────────────┐
 │        Express + WebSocket Server       │
-│  ┌──────────┐  ┌──────────────────────┐ │
-│  │ Deployers│  │ Services             │ │
-│  │  local   │  │  container discovery │ │
-│  │  k8s  *  │  │  (podman / docker)   │ │
-│  │  ssh  *  │  │                      │ │
-│  └──────────┘  └──────────────────────┘ │
+│  ┌──────────────┐  ┌────────────────┐   │
+│  │  Deployers   │  │  Services      │   │
+│  │   local      │  │  container     │   │
+│  │   kubernetes │  │  discovery     │   │
+│  └──────────────┘  └────────────────┘   │
 └─────────────────────────────────────────┘
-              * = planned
+         │                   │
+   ┌─────┴─────┐      ┌──────┴──────┐
+   │ K8s API / │      │ podman /    │
+   │ OpenShift │      │ docker sock │
+   └───────────┘      └─────────────┘
 ```
 
-## Container Details
+## Project Structure
 
-The installer launches OpenClaw containers with:
-
-- `-p <port>:18789` — port mapping (works on macOS and Linux)
-- `--bind lan` — gateway listens on `0.0.0.0` (required for port mapping)
-- Labels: `openclaw.managed=true`, `openclaw.prefix=<prefix>`, `openclaw.agent=<name>`
-- Volume: `openclaw-<prefix>-data` at `/home/node/.openclaw`
-
-## Manual Setup
-
-If `run.sh` doesn't work for your setup:
-
-```bash
-# Linux (podman)
-podman run -d --name claw-installer \
-  --security-opt label=disable \
-  -p 3000:3000 \
-  -v /run/user/$(id -u)/podman/podman.sock:/run/podman/podman.sock \
-  -v ~/.openclaw-installer:/home/node/.openclaw-installer:Z \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  quay.io/sallyom/claw-installer:latest
-
-# Docker (any platform)
-docker run -d --name claw-installer \
-  -p 3000:3000 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/.openclaw-installer:/home/node/.openclaw-installer \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  quay.io/sallyom/claw-installer:latest
-
-# macOS with podman (run from source — socket forwarding not supported)
-git clone https://github.com/sallyom/claw-installer.git
-cd claw-installer && npm install && npm run dev
+```
+claw-installer/
+├── run.sh                        # Launcher script
+├── Dockerfile                    # Multi-stage build
+├── docs/
+│   ├── deploy-local.md           # Local deployment guide
+│   ├── deploy-openshift.md       # OpenShift/K8s deployment guide
+│   ├── blog-installing-openclaw-on-openshift.md
+│   └── examples/                 # Annotated YAMLs for every K8s resource
+├── src/
+│   ├── server/
+│   │   ├── index.ts              # Express + WS server
+│   │   ├── ws.ts                 # WebSocket log streaming
+│   │   ├── routes/
+│   │   │   ├── deploy.ts         # POST /api/deploy
+│   │   │   ├── status.ts         # Instance discovery and lifecycle
+│   │   │   └── agents.ts         # Agent browsing
+│   │   ├── deployers/
+│   │   │   ├── types.ts          # Deployer interface
+│   │   │   ├── local.ts          # Podman/docker deployer
+│   │   │   ├── kubernetes.ts     # K8s/OpenShift deployer
+│   │   │   └── openshift/        # Static YAMLs for OAuth proxy
+│   │   └── services/
+│   │       ├── container.ts      # Runtime detection, container discovery
+│   │       └── k8s.ts            # Kubeconfig, OpenShift detection
+│   └── client/
+│       ├── App.tsx               # Tabs: Deploy | Instances | Agents
+│       └── components/
+│           ├── DeployForm.tsx     # Config form + credential upload
+│           ├── LogStream.tsx      # Real-time deploy output
+│           ├── InstanceList.tsx   # Manage running instances
+│           └── AgentBrowser.tsx   # Browse agents
+└── package.json
 ```
 
 ## API
@@ -242,48 +152,17 @@ cd claw-installer && npm install && npm run dev
 | `/api/instances/:name/data` | DELETE | Delete the data volume |
 | `/ws` | WebSocket | Subscribe to deploy logs |
 
-## Project Structure
-
-```
-claw-installer/
-├── run.sh                        # Launcher script (macOS + Linux, podman + docker)
-├── Dockerfile                    # Multi-stage build (node + podman CLI)
-├── src/
-│   ├── server/
-│   │   ├── index.ts              # Express + WS server
-│   │   ├── ws.ts                 # WebSocket log streaming
-│   │   ├── routes/
-│   │   │   ├── deploy.ts         # POST /api/deploy
-│   │   │   ├── status.ts         # Instance discovery and lifecycle
-│   │   │   └── agents.ts         # Agent browsing
-│   │   ├── deployers/
-│   │   │   ├── types.ts          # Deployer interface
-│   │   │   └── local.ts          # Podman/docker deployer + agent provisioning
-│   │   └── services/
-│   │       └── container.ts      # Runtime detection, container/volume discovery
-│   └── client/
-│       ├── App.tsx               # Tabs: Deploy | Instances | Agents
-│       ├── components/
-│       │   ├── DeployForm.tsx     # Config form + .env upload
-│       │   ├── LogStream.tsx      # Real-time deploy output
-│       │   ├── InstanceList.tsx   # Manage running instances
-│       │   └── AgentBrowser.tsx   # Browse agents
-│       └── styles/theme.css      # Dark theme
-└── package.json
-```
-
 ## Roadmap
 
 - [x] Local deployer (podman + docker, macOS + Linux)
-- [x] Launcher script with platform auto-detection
-- [x] Instance discovery and lifecycle
-- [x] Gateway token access from UI
-- [x] Saved configs and .env upload
-- [x] Multi-provider support (Anthropic, OpenAI, Vertex AI)
-- [x] Model selection (explicit or auto-detect)
-- [x] Default agent provisioning with workspace files
+- [x] Kubernetes / OpenShift deployer
+- [x] OpenShift OAuth proxy (no cluster-admin)
+- [x] Vertex AI support (Google and Anthropic via GCP SA JSON)
+- [x] Instance discovery and lifecycle management
+- [x] Agent provisioning with full workspace files
 - [x] Custom agent/skill provisioning from host directory
+- [x] Deploy config persistence for re-deploy
+- [ ] Subagent provisioning
 - [ ] Cron job provisioning from JOB.md files
-- [ ] Agent/skill import from git repos
-- [ ] Kubernetes deployer (K8s API)
+- [ ] Skill import from git repos
 - [ ] SSH deployer (remote host)
