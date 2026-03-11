@@ -1,8 +1,10 @@
 import * as k8s from "@kubernetes/client-node";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import jsYaml from "js-yaml";
 import { v4 as uuid } from "uuid";
 import { coreApi, appsApi, loadKubeConfig, isOpenShift } from "../services/k8s.js";
 import type {
@@ -13,6 +15,69 @@ import type {
 } from "./types.js";
 
 const DEFAULT_IMAGE = process.env.OPENCLAW_IMAGE || "quay.io/sallyom/openclaw:latest";
+
+// ── OpenShift OAuth proxy helpers ──────────────────────────────────
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function loadOpenshiftYaml(filename: string, vars: Record<string, string>): string {
+  let content = readFileSync(join(__dirname, "openshift", filename), "utf-8");
+  for (const [key, value] of Object.entries(vars)) {
+    content = content.replaceAll(key, value);
+  }
+  return content;
+}
+
+function oauthProxyContainer(ns: string): k8s.V1Container {
+  const yaml = loadOpenshiftYaml("oauth-proxy-container.yaml", {
+    __CLIENT_ID__: `system:serviceaccount:${ns}:openclaw-oauth-proxy`,
+  });
+  return jsYaml.load(yaml) as k8s.V1Container;
+}
+
+function oauthServiceAccount(ns: string): k8s.V1ServiceAccount {
+  const yaml = loadOpenshiftYaml("serviceaccount.yaml", {
+    __NAMESPACE__: ns,
+  });
+  return jsYaml.load(yaml) as k8s.V1ServiceAccount;
+}
+
+async function oauthConfigSecret(ns: string): Promise<k8s.V1Secret> {
+  // For SA-based OAuth, the client-secret must be a valid SA token.
+  // Create a token for the openclaw-oauth-proxy SA.
+  let clientSecret: string;
+  try {
+    const core = coreApi();
+    const tokenRequest: k8s.AuthenticationV1TokenRequest = {
+      apiVersion: "authentication.k8s.io/v1",
+      kind: "TokenRequest",
+      spec: { expirationSeconds: 365 * 24 * 3600 }, // 1 year
+    };
+    const result = await core.createNamespacedServiceAccountToken({
+      name: "openclaw-oauth-proxy",
+      namespace: ns,
+      body: tokenRequest,
+    });
+    clientSecret = result.status?.token || "";
+  } catch {
+    // Fallback: use a generated token (requires OAuthClient cluster resource)
+    clientSecret = randomBytes(32).toString("base64");
+  }
+
+  return {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: "openclaw-oauth-config",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    stringData: {
+      "client-secret": clientSecret,
+      cookie_secret: randomBytes(16).toString("hex"),
+    },
+  };
+}
 
 function tryParseProjectId(saJson: string): string {
   try {
@@ -48,17 +113,22 @@ function deriveModel(config: DeployConfig): string {
   return "claude-sonnet-4-6";
 }
 
-function buildOpenClawConfig(config: DeployConfig, gatewayToken: string): object {
+function buildOpenClawConfig(config: DeployConfig, gatewayToken: string, opts?: { routeUrl?: string }): object {
   const id = agentId(config);
   const model = deriveModel(config);
+  const controlUi: Record<string, unknown> = {
+    dangerouslyAllowHostHeaderOriginFallback: true,
+    dangerouslyDisableDeviceAuth: true,
+  };
+  if (opts?.routeUrl) {
+    controlUi.allowedOrigins = [opts.routeUrl];
+  }
   const ocConfig: Record<string, unknown> = {
     gateway: {
       mode: "local",
+      bind: opts?.routeUrl ? "loopback" : undefined,
       auth: { token: gatewayToken },
-      controlUi: {
-        dangerouslyAllowHostHeaderOriginFallback: true,
-        dangerouslyDisableDeviceAuth: true,
-      },
+      controlUi,
     },
     agents: {
       defaults: {
@@ -336,7 +406,7 @@ function pvcManifest(ns: string): k8s.V1PersistentVolumeClaim {
   };
 }
 
-function configMapManifest(ns: string, config: DeployConfig, gatewayToken: string): k8s.V1ConfigMap {
+function configMapManifest(ns: string, config: DeployConfig, gatewayToken: string, routeUrl?: string): k8s.V1ConfigMap {
   return {
     apiVersion: "v1",
     kind: "ConfigMap",
@@ -346,7 +416,7 @@ function configMapManifest(ns: string, config: DeployConfig, gatewayToken: strin
       labels: { app: "openclaw" },
     },
     data: {
-      "openclaw.json": JSON.stringify(buildOpenClawConfig(config, gatewayToken)),
+      "openclaw.json": JSON.stringify(buildOpenClawConfig(config, gatewayToken, { routeUrl })),
     },
   };
 }
@@ -404,7 +474,17 @@ function secretManifest(ns: string, config: DeployConfig, gatewayToken: string):
   };
 }
 
-function serviceManifest(ns: string): k8s.V1Service {
+function serviceManifest(ns: string, onOpenShift: boolean): k8s.V1Service {
+  const ports: k8s.V1ServicePort[] = [
+    { name: "gateway", port: 18789, targetPort: 18789 as unknown as k8s.IntOrString, protocol: "TCP" },
+  ];
+  if (onOpenShift) {
+    ports.push({ name: "oauth-ui", port: 8443, targetPort: 8443 as unknown as k8s.IntOrString, protocol: "TCP" });
+  }
+  const annotations: Record<string, string> = {};
+  if (onOpenShift) {
+    annotations["service.beta.openshift.io/serving-cert-secret-name"] = "openclaw-proxy-tls";
+  }
   return {
     apiVersion: "v1",
     kind: "Service",
@@ -412,18 +492,17 @@ function serviceManifest(ns: string): k8s.V1Service {
       name: "openclaw",
       namespace: ns,
       labels: { app: "openclaw" },
+      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
     },
     spec: {
       type: "ClusterIP",
       selector: { app: "openclaw" },
-      ports: [
-        { name: "gateway", port: 18789, targetPort: 18789 as unknown as k8s.IntOrString, protocol: "TCP" },
-      ],
+      ports,
     },
   };
 }
 
-function deploymentManifest(ns: string, config: DeployConfig): k8s.V1Deployment {
+function deploymentManifest(ns: string, config: DeployConfig, onOpenShift: boolean): k8s.V1Deployment {
   const image = config.image || DEFAULT_IMAGE;
   const id = agentId(config);
 
@@ -499,8 +578,12 @@ echo "Config initialized"
       selector: { matchLabels: { app: "openclaw" } },
       strategy: { type: "Recreate" },
       template: {
-        metadata: { labels: { app: "openclaw" } },
+        metadata: {
+          labels: { app: "openclaw" },
+          annotations: { "openclaw.io/restart-at": new Date().toISOString() },
+        },
         spec: {
+          ...(onOpenShift ? { serviceAccountName: "openclaw-oauth-proxy" } : {}),
           initContainers: [
             {
               name: "init-config",
@@ -519,13 +602,15 @@ echo "Config initialized"
             },
           ],
           containers: [
+            // On OpenShift, add oauth-proxy sidecar before the gateway
+            ...(onOpenShift ? [oauthProxyContainer(ns)] : []),
             {
               name: "gateway",
               image,
               imagePullPolicy: "Always",
               command: [
                 "node", "dist/index.js", "gateway", "run",
-                "--bind", "lan", "--port", "18789",
+                "--bind", onOpenShift ? "loopback" : "lan", "--port", "18789",
               ],
               ports: [{ name: "gateway", containerPort: 18789, protocol: "TCP" }],
               env: envVars,
@@ -579,6 +664,10 @@ echo "Config initialized"
             ...(config.gcpServiceAccountJson
               ? [{ name: "gcp-sa", secret: { secretName: "gcp-sa" } }]
               : []),
+            ...(onOpenShift ? [
+              { name: "oauth-config", secret: { secretName: "openclaw-oauth-config" } },
+              { name: "proxy-tls", secret: { secretName: "openclaw-proxy-tls" } },
+            ] : []),
           ],
         },
       },
@@ -638,8 +727,10 @@ export class KubernetesDeployer implements Deployer {
     const gatewayToken = generateToken();
     const core = coreApi();
     const apps = appsApi();
+    const onOcp = await isOpenShift();
 
     log(`Deploying OpenClaw to namespace: ${ns}`);
+    if (onOcp) log("OpenShift detected — deploying with OAuth proxy");
 
     // Load workspace files (prefers user-customized from ~/.openclaw-installer/agents/)
     const { files: workspaceFiles } = loadWorkspaceFiles(config, log);
@@ -647,7 +738,46 @@ export class KubernetesDeployer implements Deployer {
     // 1. Namespace
     await applyNamespace(core, ns, log);
 
-    // 2. PVC (immutable — skip if exists)
+    // 2. OpenShift: ServiceAccount + Route + OAuth secret (before config, to get route URL)
+    let routeUrl: string | undefined;
+    if (onOcp) {
+      // ServiceAccount with OAuth redirect annotation
+      const sa = oauthServiceAccount(ns);
+      await applyResource(
+        () => core.readNamespacedServiceAccount({ name: "openclaw-oauth-proxy", namespace: ns }),
+        () => core.createNamespacedServiceAccount({ namespace: ns, body: sa }),
+        () => core.replaceNamespacedServiceAccount({ name: "openclaw-oauth-proxy", namespace: ns, body: sa }),
+        "ServiceAccount openclaw-oauth-proxy",
+        log,
+      );
+
+      // OAuth config secret (client-secret + cookie_secret)
+      const oauthSecret = await oauthConfigSecret(ns);
+      await applyResource(
+        () => core.readNamespacedSecret({ name: "openclaw-oauth-config", namespace: ns }),
+        () => core.createNamespacedSecret({ namespace: ns, body: oauthSecret }),
+        null, // Don't replace — keep existing secrets on re-deploy
+        "Secret openclaw-oauth-config",
+        log,
+      );
+
+      // Service first (needed for serving-cert-secret before route)
+      const svc = serviceManifest(ns, onOcp);
+      await applyResource(
+        () => core.readNamespacedService({ name: "openclaw", namespace: ns }),
+        () => core.createNamespacedService({ namespace: ns, body: svc }),
+        () => core.replaceNamespacedService({ name: "openclaw", namespace: ns, body: svc }),
+        "Service openclaw",
+        log,
+      );
+
+      // Route (target oauth-ui port)
+      await this.applyRoute(ns, log, true);
+      routeUrl = await this.getRouteUrl(ns);
+      if (routeUrl) log(`Route URL: ${routeUrl}`);
+    }
+
+    // 3. PVC (immutable — skip if exists)
     await applyResource(
       () => core.readNamespacedPersistentVolumeClaim({ name: "openclaw-home-pvc", namespace: ns }),
       () => core.createNamespacedPersistentVolumeClaim({ namespace: ns, body: pvcManifest(ns) }),
@@ -656,8 +786,8 @@ export class KubernetesDeployer implements Deployer {
       log,
     );
 
-    // 3. ConfigMap (openclaw.json)
-    const cm = configMapManifest(ns, config, gatewayToken);
+    // 4. ConfigMap (openclaw.json — with allowedOrigins on OpenShift)
+    const cm = configMapManifest(ns, config, gatewayToken, routeUrl);
     await applyResource(
       () => core.readNamespacedConfigMap({ name: "openclaw-config", namespace: ns }),
       () => core.createNamespacedConfigMap({ namespace: ns, body: cm }),
@@ -666,7 +796,7 @@ export class KubernetesDeployer implements Deployer {
       log,
     );
 
-    // 4. ConfigMap (agent workspace files)
+    // 5. ConfigMap (agent workspace files)
     const agentCm = agentConfigMapManifest(ns, config, workspaceFiles);
     await applyResource(
       () => core.readNamespacedConfigMap({ name: "openclaw-agent", namespace: ns }),
@@ -676,7 +806,7 @@ export class KubernetesDeployer implements Deployer {
       log,
     );
 
-    // 5. Secret
+    // 6. Secret
     const secret = secretManifest(ns, config, gatewayToken);
     await applyResource(
       () => core.readNamespacedSecret({ name: "openclaw-secrets", namespace: ns }),
@@ -686,7 +816,7 @@ export class KubernetesDeployer implements Deployer {
       log,
     );
 
-    // 5b. GCP service account secret (for Vertex AI)
+    // 6b. GCP service account secret (for Vertex AI)
     if (config.gcpServiceAccountJson) {
       const gcpSecret = gcpSaSecretManifest(ns, config.gcpServiceAccountJson);
       await applyResource(
@@ -698,18 +828,20 @@ export class KubernetesDeployer implements Deployer {
       );
     }
 
-    // 6. Service
-    const svc = serviceManifest(ns);
-    await applyResource(
-      () => core.readNamespacedService({ name: "openclaw", namespace: ns }),
-      () => core.createNamespacedService({ namespace: ns, body: svc }),
-      () => core.replaceNamespacedService({ name: "openclaw", namespace: ns, body: svc }),
-      "Service openclaw",
-      log,
-    );
+    // 7. Service (already created on OpenShift above, create for plain K8s)
+    if (!onOcp) {
+      const svc = serviceManifest(ns, false);
+      await applyResource(
+        () => core.readNamespacedService({ name: "openclaw", namespace: ns }),
+        () => core.createNamespacedService({ namespace: ns, body: svc }),
+        () => core.replaceNamespacedService({ name: "openclaw", namespace: ns, body: svc }),
+        "Service openclaw",
+        log,
+      );
+    }
 
-    // 7. Deployment
-    const dep = deploymentManifest(ns, config);
+    // 8. Deployment
+    const dep = deploymentManifest(ns, config, onOcp);
     await applyResource(
       () => apps.readNamespacedDeployment({ name: "openclaw", namespace: ns }),
       () => apps.createNamespacedDeployment({ namespace: ns, body: dep }),
@@ -718,22 +850,37 @@ export class KubernetesDeployer implements Deployer {
       log,
     );
 
-    // 8. OpenShift Route (if applicable)
-    const onOpenShift = await isOpenShift();
-    if (onOpenShift) {
-      await this.applyRoute(ns, log);
-    }
-
-    const url = onOpenShift
-      ? await this.getRouteUrl(ns)
-      : `(use: kubectl port-forward svc/openclaw 18789:18789 -n ${ns})`;
+    const url = routeUrl
+      || `(use: kubectl port-forward svc/openclaw 18789:18789 -n ${ns})`;
 
     log(`Gateway token: ${gatewayToken}`);
     log(`OpenClaw deployed to ${ns}`);
-    if (onOpenShift) {
-      log(`Route URL: ${url}`);
-    } else {
+    if (!onOcp) {
       log(`Access via port-forward: kubectl port-forward svc/openclaw 18789:18789 -n ${ns}`);
+    }
+
+    // Save deploy config for re-deploy (strip secrets, keep references)
+    try {
+      const configDir = join(homedir(), ".openclaw-installer", ns);
+      mkdirSync(configDir, { recursive: true });
+      const savedConfig = {
+        ...config,
+        namespace: ns,
+        // Strip secret values — they're in the cluster, not needed on disk
+        anthropicApiKey: config.anthropicApiKey ? "(set)" : undefined,
+        openaiApiKey: config.openaiApiKey ? "(set)" : undefined,
+        gcpServiceAccountJson: config.gcpServiceAccountJson ? "(set)" : undefined,
+        telegramBotToken: config.telegramBotToken ? "(set)" : undefined,
+      };
+      writeFileSync(
+        join(configDir, "deploy-config.json"),
+        JSON.stringify(savedConfig, null, 2),
+        { mode: 0o600 },
+      );
+      writeFileSync(join(configDir, "gateway-token"), gatewayToken + "\n", { mode: 0o600 });
+      log(`Deploy config saved to ${configDir}/deploy-config.json`);
+    } catch {
+      log("Could not save deploy config to host");
     }
 
     return {
@@ -802,6 +949,9 @@ export class KubernetesDeployer implements Deployer {
       { name: "Service", fn: () => core.deleteNamespacedService({ name: "openclaw", namespace: ns }) },
       { name: "Secret openclaw-secrets", fn: () => core.deleteNamespacedSecret({ name: "openclaw-secrets", namespace: ns }) },
       { name: "Secret gcp-sa", fn: () => core.deleteNamespacedSecret({ name: "gcp-sa", namespace: ns }) },
+      { name: "Secret openclaw-oauth-config", fn: () => core.deleteNamespacedSecret({ name: "openclaw-oauth-config", namespace: ns }) },
+      { name: "Secret openclaw-proxy-tls", fn: () => core.deleteNamespacedSecret({ name: "openclaw-proxy-tls", namespace: ns }) },
+      { name: "ServiceAccount openclaw-oauth-proxy", fn: () => core.deleteNamespacedServiceAccount({ name: "openclaw-oauth-proxy", namespace: ns }) },
       { name: "ConfigMap openclaw-config", fn: () => core.deleteNamespacedConfigMap({ name: "openclaw-config", namespace: ns }) },
       { name: "ConfigMap openclaw-agent", fn: () => core.deleteNamespacedConfigMap({ name: "openclaw-agent", namespace: ns }) },
       { name: "PVC", fn: () => core.deleteNamespacedPersistentVolumeClaim({ name: "openclaw-home-pvc", namespace: ns }) },
@@ -828,7 +978,7 @@ export class KubernetesDeployer implements Deployer {
 
   // ── OpenShift Route ────────────────────────────────────────────
 
-  private async applyRoute(ns: string, log: LogCallback): Promise<void> {
+  private async applyRoute(ns: string, log: LogCallback, withOauth = false): Promise<void> {
     const kc = loadKubeConfig();
     const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
     const routeParams = {
@@ -855,10 +1005,13 @@ export class KubernetesDeployer implements Deployer {
         name: "openclaw",
         namespace: ns,
         labels: { app: "openclaw" },
+        annotations: {
+          "haproxy.router.openshift.io/timeout": "30m",
+        },
       },
       spec: {
         to: { kind: "Service", name: "openclaw", weight: 100 },
-        port: { targetPort: "gateway" },
+        port: { targetPort: withOauth ? "oauth-ui" : "gateway" },
         tls: { termination: "edge", insecureEdgeTerminationPolicy: "Redirect" },
       },
     };
