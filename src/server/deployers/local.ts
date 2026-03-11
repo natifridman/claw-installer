@@ -45,7 +45,7 @@ function deriveModel(config: DeployConfig): string {
   if (config.vertexEnabled) {
     return config.vertexProvider === "anthropic"
       ? "anthropic-vertex/claude-sonnet-4-6"
-      : "google-vertex/gemini-3.1-pro";
+      : "google-vertex/gemini-2.5-pro";
   }
   if (config.openaiApiKey) {
     return "openai/gpt-5";
@@ -271,7 +271,7 @@ function buildRunArgs(config: DeployConfig, name: string, port: number): string[
   }
   if (config.vertexEnabled) {
     env.VERTEX_ENABLED = "true";
-    env.VERTEX_PROVIDER = config.vertexProvider || "google";
+    env.VERTEX_PROVIDER = config.vertexProvider || "anthropic";
     const projectId = config.googleCloudProject
       || (config.gcpServiceAccountJson ? tryParseProjectId(config.gcpServiceAccountJson) : "");
     if (projectId) {
@@ -673,7 +673,7 @@ something that requires the user's attention.`;
       }
       if (config.vertexEnabled) {
         lines.push(`VERTEX_ENABLED=true`);
-        lines.push(`VERTEX_PROVIDER=${config.vertexProvider || "google"}`);
+        lines.push(`VERTEX_PROVIDER=${config.vertexProvider || "anthropic"}`);
         const projectId = config.googleCloudProject
           || (config.gcpServiceAccountJson ? tryParseProjectId(config.gcpServiceAccountJson) : "");
         if (projectId) {

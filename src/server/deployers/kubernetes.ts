@@ -108,7 +108,7 @@ function deriveModel(config: DeployConfig): string {
   if (config.vertexEnabled) {
     return config.vertexProvider === "anthropic"
       ? "anthropic-vertex/claude-sonnet-4-6"
-      : "google-vertex/gemini-3.1-pro";
+      : "google-vertex/gemini-2.5-pro";
   }
   if (config.openaiApiKey) return "openai/gpt-5";
   if (config.modelEndpoint) return "openai/default";
@@ -536,7 +536,7 @@ function deploymentManifest(ns: string, config: DeployConfig, onOpenShift: boole
 
   if (config.vertexEnabled) {
     envVars.push({ name: "VERTEX_ENABLED", value: "true" });
-    envVars.push({ name: "VERTEX_PROVIDER", value: config.vertexProvider || "google" });
+    envVars.push({ name: "VERTEX_PROVIDER", value: config.vertexProvider || "anthropic" });
     if (config.gcpServiceAccountJson) {
       envVars.push({ name: "GOOGLE_APPLICATION_CREDENTIALS", value: "/home/node/gcp/sa.json" });
     }

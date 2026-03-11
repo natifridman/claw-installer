@@ -136,11 +136,26 @@ fi
 
 # Collect env var flags
 ENV_FLAGS=()
-for var in ANTHROPIC_API_KEY OPENAI_API_KEY OPENCLAW_IMAGE OPENCLAW_PREFIX MODEL_ENDPOINT TELEGRAM_BOT_TOKEN TELEGRAM_ALLOW_FROM; do
+for var in ANTHROPIC_API_KEY OPENAI_API_KEY OPENCLAW_IMAGE OPENCLAW_PREFIX MODEL_ENDPOINT TELEGRAM_BOT_TOKEN TELEGRAM_ALLOW_FROM \
+           GOOGLE_CLOUD_PROJECT GCLOUD_PROJECT CLOUD_SDK_PROJECT \
+           GOOGLE_VERTEX_PROJECT ANTHROPIC_VERTEX_PROJECT_ID \
+           GOOGLE_CLOUD_LOCATION GOOGLE_VERTEX_LOCATION \
+           VERTEX_ENABLED VERTEX_PROVIDER; do
   if [ -n "${!var:-}" ]; then
     ENV_FLAGS+=("-e" "$var=${!var}")
   fi
 done
+
+# Mount GCP credential files into the container
+GCP_MOUNT_FLAGS=()
+if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+  GCP_MOUNT_FLAGS+=("-v" "${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/gcp-creds/sa.json:ro")
+  ENV_FLAGS+=("-e" "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-creds/sa.json")
+fi
+ADC_PATH="${HOME}/.config/gcloud/application_default_credentials.json"
+if [ -f "$ADC_PATH" ]; then
+  GCP_MOUNT_FLAGS+=("-v" "${ADC_PATH}:/tmp/gcp-adc/application_default_credentials.json:ro")
+fi
 
 # ---- Docker (simple on all platforms) ----
 if [ "$RUNTIME" = "docker" ]; then
@@ -157,6 +172,7 @@ if [ "$RUNTIME" = "docker" ]; then
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$HOME/.openclaw-installer:/home/node/.openclaw-installer" \
     "${ENV_FLAGS[@]}" \
+    "${GCP_MOUNT_FLAGS[@]}" \
     "$IMAGE_NAME"
 
   success "OpenClaw Installer running at http://localhost:${PORT}"
@@ -193,6 +209,7 @@ case "$OS" in
       -v "$PODMAN_SOCK:/run/podman/podman.sock" \
       -v "$HOME/.openclaw-installer:/home/node/.openclaw-installer:Z" \
       "${ENV_FLAGS[@]}" \
+      "${GCP_MOUNT_FLAGS[@]}" \
       "$IMAGE_NAME"
 
     success "OpenClaw Installer running at http://localhost:${PORT}"

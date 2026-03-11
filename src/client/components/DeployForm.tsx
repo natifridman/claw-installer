@@ -19,6 +19,18 @@ interface ServerDefaults {
   isOpenShift?: boolean;
 }
 
+interface GcpDefaults {
+  projectId: string | null;
+  location: string | null;
+  hasServiceAccountJson: boolean;
+  credentialType: string | null;
+  sources: {
+    projectId?: string;
+    location?: string;
+    credentials?: string;
+  };
+}
+
 interface SavedConfig {
   name: string;
   vars: Record<string, string>;
@@ -63,7 +75,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
     port: "18789",
     // Vertex AI
     vertexEnabled: false,
-    vertexProvider: "google" as "google" | "anthropic",
+    vertexProvider: "anthropic" as "google" | "anthropic",
     googleCloudProject: "",
     googleCloudLocation: "",
     gcpServiceAccountJson: "",
@@ -80,6 +92,26 @@ export default function DeployForm({ onDeployStarted }: Props) {
     // Kubernetes
     namespace: "",
   });
+
+  const [gcpDefaults, setGcpDefaults] = useState<GcpDefaults | null>(null);
+  const [gcpDefaultsFetched, setGcpDefaultsFetched] = useState(false);
+
+  // Fetch GCP defaults when Vertex is first enabled
+  useEffect(() => {
+    if (!config.vertexEnabled || gcpDefaultsFetched) return;
+    setGcpDefaultsFetched(true);
+    fetch("/api/configs/gcp-defaults")
+      .then((r) => r.json())
+      .then((data: GcpDefaults) => {
+        setGcpDefaults(data);
+        setConfig((prev) => ({
+          ...prev,
+          googleCloudProject: prev.googleCloudProject || data.projectId || "",
+          googleCloudLocation: prev.googleCloudLocation || data.location || "",
+        }));
+      })
+      .catch(() => {});
+  }, [config.vertexEnabled, gcpDefaultsFetched]);
 
   // Fetch server defaults (detected env vars + K8s availability)
   useEffect(() => {
@@ -515,14 +547,31 @@ export default function DeployForm({ onDeployStarted }: Props) {
                   }))
                 }
               >
-                <option value="google">Google (Gemini)</option>
                 <option value="anthropic">Anthropic (Claude via Vertex)</option>
+                <option value="google">Google (Gemini)</option>
               </select>
               <div className="hint">
                 {config.vertexProvider === "google"
                   ? "Agents use google-vertex/gemini-2.5-pro"
                   : "Agents use anthropic-vertex/claude-sonnet-4-6"}
               </div>
+              {config.vertexProvider === "google"
+                && gcpDefaults?.credentialType === "authorized_user"
+                && !config.gcpServiceAccountJson && (
+                <div style={{
+                  marginTop: "0.5rem",
+                  padding: "0.5rem 0.75rem",
+                  background: "rgba(231, 76, 60, 0.1)",
+                  border: "1px solid rgba(231, 76, 60, 0.3)",
+                  borderRadius: "6px",
+                  fontSize: "0.85rem",
+                  color: "#e74c3c",
+                }}>
+                  Your environment credentials are Application Default Credentials (from <code>gcloud auth</code>),
+                  which are not supported by Gemini on Vertex. Either upload a Service Account key file below,
+                  or switch to Anthropic (Claude via Vertex) which works with Application Default Credentials.
+                </div>
+              )}
             </div>
 
             <div className="form-row">
@@ -534,20 +583,30 @@ export default function DeployForm({ onDeployStarted }: Props) {
                   value={config.googleCloudProject}
                   onChange={(e) => update("googleCloudProject", e.target.value)}
                 />
+                {gcpDefaults?.sources.projectId && config.googleCloudProject === gcpDefaults.projectId && (
+                  <div className="hint">from {gcpDefaults.sources.projectId}</div>
+                )}
               </div>
               <div className="form-group">
                 <label>GCP Region</label>
                 <input
                   type="text"
-                  placeholder={config.vertexProvider === "anthropic" ? "us-east5" : "us-central1"}
+                  placeholder={config.vertexProvider === "anthropic" ? "us-east5 (default)" : "us-central1 (default)"}
                   value={config.googleCloudLocation}
                   onChange={(e) => update("googleCloudLocation", e.target.value)}
                 />
+                {gcpDefaults?.sources.location && config.googleCloudLocation === gcpDefaults.location ? (
+                  <div className="hint">from {gcpDefaults.sources.location}</div>
+                ) : !config.googleCloudLocation && (
+                  <div className="hint">
+                    Defaults to {config.vertexProvider === "anthropic" ? "us-east5" : "us-central1"} if not set
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="form-group">
-              <label>GCP Service Account JSON</label>
+              <label>GCP Service Account Key</label>
               <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
                 {config.gcpServiceAccountJson ? (
                   <div
@@ -572,18 +631,17 @@ export default function DeployForm({ onDeployStarted }: Props) {
                     })()}
                   </div>
                 ) : (
-                  <div
-                    style={{
-                      flex: 1,
-                      padding: "0.5rem 0.75rem",
-                      border: "1px dashed var(--border)",
-                      borderRadius: "6px",
-                      fontSize: "0.85rem",
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    No credentials file selected
-                  </div>
+                  <input
+                    type="text"
+                    placeholder={
+                      gcpDefaults?.hasServiceAccountJson
+                        ? `Using credentials from ${gcpDefaults.sources.credentials}`
+                        : "/path/to/service-account.json"
+                    }
+                    value={config.gcpServiceAccountPath}
+                    onChange={(e) => update("gcpServiceAccountPath", e.target.value)}
+                    style={{ flex: 1 }}
+                  />
                 )}
                 <label
                   className="btn btn-ghost"
@@ -601,6 +659,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
                       reader.onload = () => {
                         const text = reader.result as string;
                         update("gcpServiceAccountJson", text);
+                        update("gcpServiceAccountPath", "");
                         // Auto-fill project ID if empty
                         if (!config.googleCloudProject) {
                           try {
@@ -625,23 +684,10 @@ export default function DeployForm({ onDeployStarted }: Props) {
                 )}
               </div>
               <div className="hint">
-                Upload a service account key file, or provide a path below.
-                Project ID is auto-extracted if not set above.
-              </div>
-            </div>
-
-            <div className="form-group">
-              <label>Or: SA JSON file path (on installer host)</label>
-              <input
-                type="text"
-                placeholder="/path/to/service-account.json"
-                value={config.gcpServiceAccountPath}
-                onChange={(e) => update("gcpServiceAccountPath", e.target.value)}
-                disabled={!!config.gcpServiceAccountJson}
-              />
-              <div className="hint">
-                Absolute path to the SA JSON file. The installer reads it at deploy time.
-                Disabled when a file is uploaded above.
+                Type a path to a service account key file, or use Browse to upload one.
+                {gcpDefaults?.hasServiceAccountJson && !config.gcpServiceAccountJson && !config.gcpServiceAccountPath
+                  && " Leave blank to use credentials detected from environment."}
+                {" "}Project ID is auto-extracted if not set above.
               </div>
             </div>
           </>

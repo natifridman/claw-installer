@@ -8,6 +8,7 @@ import statusRoutes from "./routes/status.js";
 import agentsRoutes from "./routes/agents.js";
 import { detectRuntime } from "./services/container.js";
 import { isClusterReachable, isOpenShift, currentContext } from "./services/k8s.js";
+import { detectGcpDefaults } from "./services/gcp.js";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 
@@ -44,6 +45,18 @@ app.get("/api/health", async (_req, res) => {
       prefix: process.env.OPENCLAW_PREFIX || userInfo().username,
       image: process.env.OPENCLAW_IMAGE || "",
     },
+  });
+});
+
+// GCP environment defaults for the Vertex AI form
+app.get("/api/configs/gcp-defaults", async (_req, res) => {
+  const defaults = await detectGcpDefaults();
+  res.json({
+    projectId: defaults.projectId,
+    location: defaults.location,
+    hasServiceAccountJson: !!defaults.serviceAccountJson,
+    credentialType: defaults.credentialType,
+    sources: defaults.sources,
   });
 });
 

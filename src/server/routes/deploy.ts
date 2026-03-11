@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { readFileSync, existsSync } from "node:fs";
 import { userInfo } from "node:os";
 import type { DeployConfig } from "../deployers/types.js";
+import { detectGcpDefaults, defaultVertexLocation } from "../services/gcp.js";
 import { LocalDeployer } from "../deployers/local.js";
 import { KubernetesDeployer } from "../deployers/kubernetes.js";
 import { createLogCallback, sendStatus } from "../ws.js";
@@ -60,7 +61,7 @@ router.post("/", async (req, res) => {
   }
   if (config.vertexEnabled === undefined && process.env.VERTEX_ENABLED === "true") {
     config.vertexEnabled = true;
-    config.vertexProvider = (process.env.VERTEX_PROVIDER as "google" | "anthropic") || "google";
+    config.vertexProvider = (process.env.VERTEX_PROVIDER as "google" | "anthropic") || "anthropic";
     config.googleCloudProject = config.googleCloudProject || process.env.GOOGLE_CLOUD_PROJECT || "";
     config.googleCloudLocation = config.googleCloudLocation || process.env.GOOGLE_CLOUD_LOCATION || "";
   }
@@ -73,6 +74,24 @@ router.post("/", async (req, res) => {
       return;
     }
     config.gcpServiceAccountJson = readFileSync(saPath, "utf-8");
+  }
+
+  // Fall back to GCP environment defaults for Vertex AI
+  if (config.vertexEnabled) {
+    const gcpDefaults = await detectGcpDefaults();
+    if (!config.googleCloudProject && gcpDefaults.projectId) {
+      config.googleCloudProject = gcpDefaults.projectId;
+    }
+    if (!config.googleCloudLocation && gcpDefaults.location) {
+      config.googleCloudLocation = gcpDefaults.location;
+    }
+    if (!config.gcpServiceAccountJson && gcpDefaults.serviceAccountJson) {
+      config.gcpServiceAccountJson = gcpDefaults.serviceAccountJson;
+    }
+    // Default location if still unset — OpenClaw requires it for provider registration
+    if (!config.googleCloudLocation) {
+      config.googleCloudLocation = defaultVertexLocation(config.vertexProvider || "anthropic");
+    }
   }
 
   const deployer = getDeployer(config.mode);
