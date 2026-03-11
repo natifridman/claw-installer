@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"tsx watch src/server/index.ts\" \"vite\"",
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "build": "vite build && tsc -p tsconfig.server.json && cp -r src/server/deployers/openshift dist/server/deployers/",
     "start": "node dist/server/index.js",
     "preview": "vite build && node dist/server/index.js"
   },

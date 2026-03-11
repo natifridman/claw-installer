@@ -17,6 +17,7 @@ export interface DeployConfig {
   googleCloudProject?: string;
   googleCloudLocation?: string;
   gcpServiceAccountJson?: string; // raw JSON content of GCP service account key file
+  gcpServiceAccountPath?: string; // absolute path to SA JSON file (server reads it)
   // Telegram channel
   telegramEnabled?: boolean;
   telegramBotToken?: string;

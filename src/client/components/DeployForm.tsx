@@ -67,6 +67,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
     googleCloudProject: "",
     googleCloudLocation: "",
     gcpServiceAccountJson: "",
+    gcpServiceAccountPath: "",
     // SSH fields
     sshHost: "",
     sshUser: "",
@@ -174,6 +175,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
         googleCloudProject: config.vertexEnabled ? config.googleCloudProject : undefined,
         googleCloudLocation: config.vertexEnabled ? config.googleCloudLocation : undefined,
         gcpServiceAccountJson: config.vertexEnabled ? config.gcpServiceAccountJson || undefined : undefined,
+        gcpServiceAccountPath: config.vertexEnabled ? config.gcpServiceAccountPath || undefined : undefined,
         namespace: config.namespace || undefined,
         sshHost: config.sshHost || undefined,
         sshUser: config.sshUser || undefined,
@@ -622,8 +624,23 @@ export default function DeployForm({ onDeployStarted }: Props) {
                 )}
               </div>
               <div className="hint">
-                Service account key file for Vertex AI authentication.
+                Upload a service account key file, or provide a path below.
                 Project ID is auto-extracted if not set above.
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>Or: SA JSON file path (on installer host)</label>
+              <input
+                type="text"
+                placeholder="/path/to/service-account.json"
+                value={config.gcpServiceAccountPath}
+                onChange={(e) => update("gcpServiceAccountPath", e.target.value)}
+                disabled={!!config.gcpServiceAccountJson}
+              />
+              <div className="hint">
+                Absolute path to the SA JSON file. The installer reads it at deploy time.
+                Disabled when a file is uploaded above.
               </div>
             </div>
           </>

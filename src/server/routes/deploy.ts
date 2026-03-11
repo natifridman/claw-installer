@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
+import { readFileSync, existsSync } from "node:fs";
 import type { DeployConfig } from "../deployers/types.js";
 import { LocalDeployer } from "../deployers/local.js";
 import { KubernetesDeployer } from "../deployers/kubernetes.js";
@@ -56,6 +57,16 @@ router.post("/", async (req, res) => {
     config.vertexProvider = (process.env.VERTEX_PROVIDER as "google" | "anthropic") || "google";
     config.googleCloudProject = config.googleCloudProject || process.env.GOOGLE_CLOUD_PROJECT || "";
     config.googleCloudLocation = config.googleCloudLocation || process.env.GOOGLE_CLOUD_LOCATION || "";
+  }
+
+  // Resolve SA JSON from path if provided (and no inline JSON)
+  if (!config.gcpServiceAccountJson && config.gcpServiceAccountPath) {
+    const saPath = config.gcpServiceAccountPath;
+    if (!existsSync(saPath)) {
+      res.status(400).json({ error: `GCP SA JSON file not found: ${saPath}` });
+      return;
+    }
+    config.gcpServiceAccountJson = readFileSync(saPath, "utf-8");
   }
 
   const deployer = getDeployer(config.mode);
