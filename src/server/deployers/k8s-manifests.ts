@@ -1,0 +1,301 @@
+import * as k8s from "@kubernetes/client-node";
+import {
+  DEFAULT_IMAGE,
+  agentId,
+  deriveModel,
+  tryParseProjectId,
+  buildOpenClawConfig,
+} from "./k8s-helpers.js";
+import { oauthProxyContainer } from "./k8s-oauth.js";
+import type { DeployConfig } from "./types.js";
+
+export function namespaceManifest(ns: string): k8s.V1Namespace {
+  return {
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: ns, labels: { "app.kubernetes.io/managed-by": "openclaw-installer" } },
+  };
+}
+
+export function pvcManifest(ns: string): k8s.V1PersistentVolumeClaim {
+  return {
+    apiVersion: "v1",
+    kind: "PersistentVolumeClaim",
+    metadata: {
+      name: "openclaw-home-pvc",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    spec: {
+      accessModes: ["ReadWriteOnce"],
+      resources: { requests: { storage: "10Gi" } },
+    },
+  };
+}
+
+export function configMapManifest(ns: string, config: DeployConfig, gatewayToken: string, routeUrl?: string): k8s.V1ConfigMap {
+  return {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name: "openclaw-config",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    data: {
+      "openclaw.json": JSON.stringify(buildOpenClawConfig(config, gatewayToken, { routeUrl })),
+    },
+  };
+}
+
+export function agentConfigMapManifest(ns: string, config: DeployConfig, workspaceFiles: Record<string, string>): k8s.V1ConfigMap {
+  return {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name: "openclaw-agent",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    data: workspaceFiles,
+  };
+}
+
+export function gcpSaSecretManifest(ns: string, saJson: string): k8s.V1Secret {
+  return {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: "gcp-sa",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    stringData: { "sa.json": saJson },
+  };
+}
+
+export function secretManifest(ns: string, config: DeployConfig, gatewayToken: string): k8s.V1Secret {
+  const data: Record<string, string> = {
+    OPENCLAW_GATEWAY_TOKEN: gatewayToken,
+  };
+  if (config.anthropicApiKey) data.ANTHROPIC_API_KEY = config.anthropicApiKey;
+  if (config.openaiApiKey) data.OPENAI_API_KEY = config.openaiApiKey;
+  if (config.modelEndpoint) data.MODEL_ENDPOINT = config.modelEndpoint;
+  if (config.telegramBotToken) data.TELEGRAM_BOT_TOKEN = config.telegramBotToken;
+
+  // Resolve project ID from config or from the SA JSON
+  const projectId = config.googleCloudProject
+    || (config.gcpServiceAccountJson ? tryParseProjectId(config.gcpServiceAccountJson) : "");
+  if (projectId) data.GOOGLE_CLOUD_PROJECT = projectId;
+  if (config.googleCloudLocation) data.GOOGLE_CLOUD_LOCATION = config.googleCloudLocation;
+
+  return {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: "openclaw-secrets",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    stringData: data,
+  };
+}
+
+export function serviceManifest(ns: string, onOpenShift: boolean): k8s.V1Service {
+  const ports: k8s.V1ServicePort[] = [
+    { name: "gateway", port: 18789, targetPort: 18789 as unknown as k8s.IntOrString, protocol: "TCP" },
+  ];
+  if (onOpenShift) {
+    ports.push({ name: "oauth-ui", port: 8443, targetPort: 8443 as unknown as k8s.IntOrString, protocol: "TCP" });
+  }
+  const annotations: Record<string, string> = {};
+  if (onOpenShift) {
+    annotations["service.beta.openshift.io/serving-cert-secret-name"] = "openclaw-proxy-tls";
+  }
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: {
+      name: "openclaw",
+      namespace: ns,
+      labels: { app: "openclaw" },
+      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+    },
+    spec: {
+      type: "ClusterIP",
+      selector: { app: "openclaw" },
+      ports,
+    },
+  };
+}
+
+export function deploymentManifest(ns: string, config: DeployConfig, onOpenShift: boolean): k8s.V1Deployment {
+  const image = config.image || DEFAULT_IMAGE;
+  const id = agentId(config);
+
+  const envVars: k8s.V1EnvVar[] = [
+    { name: "HOME", value: "/home/node" },
+    { name: "NODE_ENV", value: "production" },
+    { name: "OPENCLAW_CONFIG_DIR", value: "/home/node/.openclaw" },
+    { name: "OPENCLAW_STATE_DIR", value: "/home/node/.openclaw" },
+    {
+      name: "OPENCLAW_GATEWAY_TOKEN",
+      valueFrom: { secretKeyRef: { name: "openclaw-secrets", key: "OPENCLAW_GATEWAY_TOKEN" } },
+    },
+  ];
+
+  const optionalKeys = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "MODEL_ENDPOINT",
+    "TELEGRAM_BOT_TOKEN",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+  ];
+  for (const key of optionalKeys) {
+    envVars.push({
+      name: key,
+      valueFrom: { secretKeyRef: { name: "openclaw-secrets", key, optional: true } },
+    });
+  }
+
+  if (config.vertexEnabled) {
+    envVars.push({ name: "VERTEX_ENABLED", value: "true" });
+    envVars.push({ name: "VERTEX_PROVIDER", value: config.vertexProvider || "anthropic" });
+    if (config.gcpServiceAccountJson) {
+      envVars.push({ name: "GOOGLE_APPLICATION_CREDENTIALS", value: "/home/node/gcp/sa.json" });
+    }
+  }
+
+  const agentFiles = ["AGENTS.md", "agent.json", "SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md", "HEARTBEAT.md", "MEMORY.md"];
+  const copyLines = agentFiles
+    .map((f) => `  cp /agents/${f} /home/node/.openclaw/workspace-${id}/${f} 2>/dev/null || true`)
+    .join("\n");
+
+  const initScript = `
+cp /config/openclaw.json /home/node/.openclaw/openclaw.json
+chmod 644 /home/node/.openclaw/openclaw.json
+mkdir -p /home/node/.openclaw/workspace
+mkdir -p /home/node/.openclaw/skills
+mkdir -p /home/node/.openclaw/cron
+mkdir -p /home/node/.openclaw/workspace-${id}
+${copyLines}
+chgrp -R 0 /home/node/.openclaw 2>/dev/null || true
+chmod -R g=u /home/node/.openclaw 2>/dev/null || true
+echo "Config initialized"
+`.trim();
+
+  return {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: "openclaw",
+      namespace: ns,
+      labels: {
+        app: "openclaw",
+        "app.kubernetes.io/managed-by": "openclaw-installer",
+        "openclaw.prefix": (config.prefix || "openclaw").toLowerCase(),
+        "openclaw.agent": config.agentName.toLowerCase(),
+      },
+    },
+    spec: {
+      replicas: 1,
+      selector: { matchLabels: { app: "openclaw" } },
+      strategy: { type: "Recreate" },
+      template: {
+        metadata: {
+          labels: { app: "openclaw" },
+          annotations: { "openclaw.io/restart-at": new Date().toISOString() },
+        },
+        spec: {
+          ...(onOpenShift ? { serviceAccountName: "openclaw-oauth-proxy" } : {}),
+          initContainers: [
+            {
+              name: "init-config",
+              image: "registry.access.redhat.com/ubi9-minimal:latest",
+              imagePullPolicy: "IfNotPresent",
+              command: ["sh", "-c", initScript],
+              resources: {
+                requests: { memory: "64Mi", cpu: "50m" },
+                limits: { memory: "128Mi", cpu: "200m" },
+              },
+              volumeMounts: [
+                { name: "openclaw-home", mountPath: "/home/node/.openclaw" },
+                { name: "config-template", mountPath: "/config" },
+                { name: "agent-config", mountPath: "/agents" },
+              ],
+            },
+          ],
+          containers: [
+            // On OpenShift, add oauth-proxy sidecar before the gateway
+            ...(onOpenShift ? [oauthProxyContainer(ns)] : []),
+            {
+              name: "gateway",
+              image,
+              imagePullPolicy: "Always",
+              command: [
+                "node", "dist/index.js", "gateway", "run",
+                "--bind", onOpenShift ? "loopback" : "lan", "--port", "18789",
+              ],
+              ports: [{ name: "gateway", containerPort: 18789, protocol: "TCP" }],
+              env: envVars,
+              resources: {
+                requests: { memory: "512Mi", cpu: "250m" },
+                limits: { memory: "2Gi", cpu: "1000m" },
+              },
+              livenessProbe: {
+                exec: {
+                  command: [
+                    "node", "-e",
+                    "require('http').get('http://127.0.0.1:18789/',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))",
+                  ],
+                },
+                initialDelaySeconds: 60,
+                periodSeconds: 30,
+                timeoutSeconds: 10,
+                failureThreshold: 3,
+              },
+              readinessProbe: {
+                exec: {
+                  command: [
+                    "node", "-e",
+                    "require('http').get('http://127.0.0.1:18789/',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))",
+                  ],
+                },
+                initialDelaySeconds: 30,
+                periodSeconds: 10,
+                timeoutSeconds: 5,
+                failureThreshold: 2,
+              },
+              volumeMounts: [
+                { name: "openclaw-home", mountPath: "/home/node/.openclaw" },
+                { name: "tmp-volume", mountPath: "/tmp" },
+                ...(config.gcpServiceAccountJson
+                  ? [{ name: "gcp-sa", mountPath: "/home/node/gcp", readOnly: true }]
+                  : []),
+              ],
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ["ALL"] },
+              },
+            },
+          ],
+          volumes: [
+            { name: "openclaw-home", persistentVolumeClaim: { claimName: "openclaw-home-pvc" } },
+            { name: "config-template", configMap: { name: "openclaw-config" } },
+            { name: "agent-config", configMap: { name: "openclaw-agent" } },
+            { name: "tmp-volume", emptyDir: {} },
+            ...(config.gcpServiceAccountJson
+              ? [{ name: "gcp-sa", secret: { secretName: "gcp-sa" } }]
+              : []),
+            ...(onOpenShift ? [
+              { name: "oauth-config", secret: { secretName: "openclaw-oauth-config" } },
+              { name: "proxy-tls", secret: { secretName: "openclaw-proxy-tls" } },
+            ] : []),
+          ],
+        },
+      },
+    },
+  };
+}

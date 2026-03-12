@@ -34,6 +34,7 @@ interface GcpDefaults {
 
 interface SavedConfig {
   name: string;
+  type: "local" | "k8s";
   vars: Record<string, string>;
 }
 
@@ -60,11 +61,11 @@ const MODES: Array<{ id: Mode; icon: string; title: string; desc: string; disabl
 ];
 
 const PROVIDER_OPTIONS: Array<{ id: InferenceProvider; label: string; desc: string }> = [
-  { id: "anthropic", label: "Anthropic (Direct API)", desc: "Claude models via Anthropic API" },
+  { id: "anthropic", label: "Anthropic", desc: "Claude models via Anthropic API" },
   { id: "openai", label: "OpenAI", desc: "GPT models via OpenAI API" },
   { id: "vertex-anthropic", label: "Google Vertex AI (Claude)", desc: "Claude models via Google Cloud" },
   { id: "vertex-google", label: "Google Vertex AI (Gemini)", desc: "Gemini models via Google Cloud" },
-  { id: "custom-endpoint", label: "Custom Endpoint", desc: "OpenAI-compatible self-hosted model server" },
+  { id: "custom-endpoint", label: "Model Endpoint", desc: "OpenAI-compatible self-hosted model server" },
 ];
 
 const MODEL_DEFAULTS: Record<InferenceProvider, string> = {
@@ -179,28 +180,36 @@ export default function DeployForm({ onDeployStarted }: Props) {
   }, []);
 
   const applyVars = (vars: Record<string, string>) => {
-    // Map legacy VERTEX_ENABLED / VERTEX_PROVIDER to inferenceProvider
-    if (vars.VERTEX_ENABLED === "true") {
-      const vp = vars.VERTEX_PROVIDER || "anthropic";
+    // Support both local .env keys (OPENCLAW_PREFIX) and K8s JSON keys (prefix)
+    const v = (envKey: string, jsonKey: string) => vars[envKey] || vars[jsonKey] || "";
+
+    // Map VERTEX_ENABLED / VERTEX_PROVIDER to inferenceProvider (both key formats)
+    const vertexEnabled = vars.VERTEX_ENABLED === "true" || vars.vertexEnabled === "true";
+    if (vertexEnabled) {
+      const vp = vars.VERTEX_PROVIDER || vars.vertexProvider || "anthropic";
       setInferenceProvider(vp === "google" ? "vertex-google" : "vertex-anthropic");
-    } else if (vars.MODEL_ENDPOINT) {
+    } else if (v("MODEL_ENDPOINT", "modelEndpoint")) {
       setInferenceProvider("custom-endpoint");
+    } else if (v("OPENAI_API_KEY", "openaiApiKey")) {
+      setInferenceProvider("openai");
+    } else if (v("ANTHROPIC_API_KEY", "anthropicApiKey")) {
+      setInferenceProvider("anthropic");
     }
 
     setConfig((prev) => ({
       ...prev,
-      prefix: vars.OPENCLAW_PREFIX || prev.prefix,
-      agentName: vars.OPENCLAW_AGENT_NAME || prev.agentName,
-      agentDisplayName: vars.OPENCLAW_DISPLAY_NAME || prev.agentDisplayName,
-      image: vars.OPENCLAW_IMAGE || prev.image,
-      port: vars.OPENCLAW_PORT || prev.port,
-      agentModel: vars.AGENT_MODEL || prev.agentModel,
-      modelEndpoint: vars.MODEL_ENDPOINT || prev.modelEndpoint,
-      googleCloudProject: vars.GOOGLE_CLOUD_PROJECT || prev.googleCloudProject,
-      googleCloudLocation: vars.GOOGLE_CLOUD_LOCATION || prev.googleCloudLocation,
-      agentSourceDir: vars.AGENT_SOURCE_DIR || prev.agentSourceDir,
-      telegramBotToken: vars.TELEGRAM_BOT_TOKEN || prev.telegramBotToken,
-      telegramAllowFrom: vars.TELEGRAM_ALLOW_FROM || prev.telegramAllowFrom,
+      prefix: v("OPENCLAW_PREFIX", "prefix") || prev.prefix,
+      agentName: v("OPENCLAW_AGENT_NAME", "agentName") || prev.agentName,
+      agentDisplayName: v("OPENCLAW_DISPLAY_NAME", "agentDisplayName") || prev.agentDisplayName,
+      image: v("OPENCLAW_IMAGE", "image") || prev.image,
+      port: v("OPENCLAW_PORT", "port") || prev.port,
+      agentModel: v("AGENT_MODEL", "agentModel") || prev.agentModel,
+      modelEndpoint: v("MODEL_ENDPOINT", "modelEndpoint") || prev.modelEndpoint,
+      googleCloudProject: v("GOOGLE_CLOUD_PROJECT", "googleCloudProject") || prev.googleCloudProject,
+      googleCloudLocation: v("GOOGLE_CLOUD_LOCATION", "googleCloudLocation") || prev.googleCloudLocation,
+      agentSourceDir: v("AGENT_SOURCE_DIR", "agentSourceDir") || prev.agentSourceDir,
+      telegramBotToken: v("TELEGRAM_BOT_TOKEN", "telegramBotToken") || prev.telegramBotToken,
+      telegramAllowFrom: v("TELEGRAM_ALLOW_FROM", "telegramAllowFrom") || prev.telegramAllowFrom,
     }));
   };
 
@@ -236,7 +245,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
         agentDisplayName: config.agentDisplayName || config.agentName,
         image: config.image || undefined,
         anthropicApiKey: inferenceProvider === "anthropic" ? config.anthropicApiKey || undefined : undefined,
-        openaiApiKey: inferenceProvider === "openai" ? config.openaiApiKey || undefined : undefined,
+        openaiApiKey: (inferenceProvider === "openai" || inferenceProvider === "custom-endpoint") ? config.openaiApiKey || undefined : undefined,
         agentModel: config.agentModel || undefined,
         modelEndpoint: inferenceProvider === "custom-endpoint" ? config.modelEndpoint || undefined : undefined,
         port: parseInt(config.port, 10) || 18789,
@@ -346,13 +355,16 @@ export default function DeployForm({ onDeployStarted }: Props) {
                 style={{ cursor: "pointer" }}
                 onChange={(e) => {
                   const cfg = savedConfigs.find((c) => c.name === e.target.value);
-                  if (cfg) applyVars(cfg.vars);
+                  if (cfg) {
+                    setMode(cfg.type === "k8s" ? "kubernetes" : "local");
+                    applyVars(cfg.vars);
+                  }
                 }}
                 defaultValue=""
               >
                 <option value="" disabled>Load saved config...</option>
                 {savedConfigs.map((c) => (
-                  <option key={c.name} value={c.name}>{c.name}</option>
+                  <option key={c.name} value={c.name}>{c.name} ({c.type === "k8s" ? "K8s" : "Local"})</option>
                 ))}
               </select>
             )}
@@ -682,18 +694,35 @@ export default function DeployForm({ onDeployStarted }: Props) {
         )}
 
         {inferenceProvider === "custom-endpoint" && (
-          <div className="form-group">
-            <label>Model Endpoint</label>
-            <input
-              type="text"
-              placeholder="http://vllm.openclaw-llms.svc.cluster.local/v1"
-              value={config.modelEndpoint}
-              onChange={(e) => update("modelEndpoint", e.target.value)}
-            />
-            <div className="hint">
-              OpenAI-compatible endpoint URL for your self-hosted model server
+          <>
+            <div className="form-group">
+              <label>Endpoint URL</label>
+              <input
+                type="text"
+                placeholder="http://vllm.openclaw-llms.svc.cluster.local/v1"
+                value={config.modelEndpoint}
+                onChange={(e) => update("modelEndpoint", e.target.value)}
+              />
+              <div className="hint">
+                OpenAI-compatible endpoint URL for your self-hosted model server
+              </div>
             </div>
-          </div>
+            <div className="form-group">
+              <label>API Key</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                placeholder={defaults?.hasOpenaiKey ? "(using key from environment)" : "Optional — if your endpoint requires auth"}
+                value={config.openaiApiKey}
+                onChange={(e) => update("openaiApiKey", e.target.value)}
+              />
+              <div className="hint">
+                {defaults?.hasOpenaiKey
+                  ? "Detected OPENAI_API_KEY from server environment — leave blank to use it"
+                  : "Sent as the Bearer token to your endpoint (leave blank if not required)"}
+              </div>
+            </div>
+          </>
         )}
 
         <div className="form-group">
