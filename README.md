@@ -31,6 +31,16 @@ npm test              # run all tests (server + client)
 npm run test:watch    # re-run on file changes
 ```
 
+## Native Layout
+
+`claw-installer` now uses the same home directory layout as a native OpenClaw install:
+
+- `~/.openclaw/workspace-*` for agent workspaces
+- `~/.openclaw/skills` for shared skills
+- `~/.openclaw/installer` for installer-only metadata
+
+That keeps local, Kubernetes, and native OpenClaw agent files in one place without introducing a separate installer-specific home.
+
 ## Deploy Targets
 
 | Target | Guide | What it does |
@@ -66,7 +76,7 @@ For Vertex AI, upload your GCP service account JSON file (or provide an absolute
 
 ## Customizing Your Agent
 
-After the first deploy, agent files are saved to `~/.openclaw-installer/agents/workspace-<id>/` on the host:
+After the first deploy, agent files are saved to `~/.openclaw/workspace-<id>/` on the host:
 
 ```
 AGENTS.md       # Agent identity, instructions, security rules
@@ -83,10 +93,17 @@ Edit these files locally, then push the changes to your running instance:
 
 | Deploy target | How to update agent files |
 |---------------|--------------------------|
-| **Local (podman/docker)** | Edit files in `~/.openclaw-installer/agents/workspace-<id>/`, then **Stop** and **Start** the container from the Instances tab. The installer copies your local files into the volume on every Start. |
-| **Kubernetes / OpenShift** | Edit files in `~/.openclaw-installer/agents/workspace-<id>/`, then click **Re-deploy** from the Instances tab. This updates the ConfigMap from your local files and restarts the pod. A plain Stop/Start only scales replicas — it does *not* sync files from the host. |
+| **Local (podman/docker)** | Edit files in `~/.openclaw/workspace-<id>/`, then **Stop** and **Start** the container from the Instances tab. The installer copies your local files into the volume on every Start. |
+| **Kubernetes / OpenShift** | Edit files in `~/.openclaw/workspace-<id>/`, then click **Re-deploy** from the Instances tab. This updates the ConfigMap from your local files and restarts the pod. A plain Stop/Start only scales replicas — it does *not* sync files from the host. |
 
 The installer uses your local files when they exist, falling back to generated defaults for anything missing.
+
+Current sync model is intentionally one-way by default: host files in `~/.openclaw` are the source of truth, and changes are pushed into the running instance on Local Start or Kubernetes Re-deploy. If an agent or user edits files inside the running OpenClaw UI, those changes affect the live instance immediately but do not sync back to local files yet, so they may not survive a restart or re-deploy.
+
+Planned next steps:
+
+- explicit `Pull running changes to local` sync for local and Kubernetes instances
+- optional GitOps-backed sync, so `~/.openclaw` can be treated as a tracked working tree and re-deploys can follow git state
 
 ## Architecture
 
@@ -177,7 +194,10 @@ claw-installer/
 - [x] Agent provisioning with full workspace files
 - [x] Custom agent/skill provisioning from host directory
 - [x] Deploy config persistence for re-deploy
+- [x] One-way host-to-instance workspace sync on Local Start / K8s Re-deploy
 - [ ] Subagent provisioning
 - [ ] Cron job provisioning from JOB.md files
+- [ ] Pull running changes back to local files
+- [ ] GitOps-backed workspace sync
 - [ ] Skill import from git repos
 - [ ] SSH deployer (remote host)

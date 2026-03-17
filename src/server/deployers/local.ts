@@ -1,8 +1,7 @@
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { existsSync } from "node:fs";
 import { v4 as uuid } from "uuid";
 import type {
@@ -29,6 +28,11 @@ import {
   LITELLM_IMAGE,
   LITELLM_PORT,
 } from "./litellm.js";
+import { shouldUseOtel, OTEL_HTTP_PORT } from "./otel.js";
+import { startOtelSidecar, stopOtelSidecar, startJaegerSidecar, otelContainerName, jaegerContainerName } from "./local-otel.js";
+import { JAEGER_UI_PORT } from "./otel.js";
+import { agentWorkspaceDir, installerLocalInstanceDir, openclawHomeDir } from "../paths.js";
+import { generateToken } from "./k8s-helpers.js";
 
 const DEFAULT_IMAGE = process.env.OPENCLAW_IMAGE || "quay.io/sallyom/openclaw:latest";
 const DEFAULT_PORT = 18789;
@@ -73,19 +77,41 @@ function deriveModel(config: DeployConfig): string {
 /**
  * Build the openclaw.json config for a fresh volume.
  */
-function buildOpenClawConfig(config: DeployConfig): string {
+function buildOpenClawConfig(config: DeployConfig, gatewayToken: string): string {
   const agentId = `${config.prefix || "openclaw"}_${config.agentName}`;
   const model = deriveModel(config);
   const port = config.port ?? 18789;
+  const useOtel = shouldUseOtel(config);
   const ocConfig: Record<string, unknown> = {
+    // Enable diagnostics-otel plugin so the gateway emits OTLP traces
+    ...(useOtel ? {
+      plugins: {
+        allow: ["diagnostics-otel"],
+        entries: { "diagnostics-otel": { enabled: true } },
+      },
+      diagnostics: {
+        enabled: true,
+        otel: {
+          enabled: true,
+          endpoint: `http://localhost:${OTEL_HTTP_PORT}`,
+          traces: true,
+          metrics: true,
+          logs: false,
+        },
+      },
+    } : {}),
     gateway: {
       mode: "local",
       auth: {
         mode: "token",
+        token: gatewayToken,
       },
       controlUi: {
         enabled: true,
-        allowedOrigins: [`http://localhost:${port}`],
+        allowedOrigins: [
+          `http://localhost:${port}`,
+          `http://127.0.0.1:${port}`,
+        ],
         // Required for non-loopback bind; safe because the container is only
         // exposed on localhost via port mapping.
         dangerouslyDisableDeviceAuth: true,
@@ -277,6 +303,14 @@ function runCommand(
   });
 }
 
+function defaultAgentSourceDir(isContainerized: boolean): string | null {
+  if (isContainerized) {
+    return null;
+  }
+  const dir = openclawHomeDir();
+  return existsSync(dir) ? dir : null;
+}
+
 /**
  * Build the podman/docker run args for a given config.
  * Used by both deploy() and start() since --rm means
@@ -288,8 +322,11 @@ function buildRunArgs(
   name: string,
   port: number,
   litellmMasterKey?: string,
+  otelEnvVars?: Record<string, string>,
 ): string[] {
   const useProxy = shouldUseLitellmProxy(config) && !!litellmMasterKey;
+  const useOtelSidecar = shouldUseOtel(config) && !!otelEnvVars;
+  const hasSidecars = useProxy || useOtelSidecar;
   const isPodman = runtime === "podman";
 
   const runArgs = [
@@ -300,12 +337,15 @@ function buildRunArgs(
     name,
   ];
 
-  if (useProxy && isPodman) {
-    // Podman: gateway runs in the same pod as LiteLLM (port is on the pod)
+  if (hasSidecars && isPodman) {
+    // Podman: gateway runs in the same pod as sidecars (port is on the pod)
     runArgs.push("--pod", podName(config));
-  } else if (useProxy) {
-    // Docker: share LiteLLM container's network namespace
-    runArgs.push("--network", `container:${litellmContainerName(config)}`);
+  } else if (hasSidecars && !isPodman) {
+    // Docker: share the first sidecar's network namespace
+    const networkContainer = useProxy
+      ? litellmContainerName(config)
+      : otelContainerName(config);
+    runArgs.push("--network", `container:${networkContainer}`);
   } else {
     runArgs.push("-p", `${port}:18789`);
   }
@@ -353,6 +393,11 @@ function buildRunArgs(
 
   if (config.telegramBotToken) {
     env.TELEGRAM_BOT_TOKEN = config.telegramBotToken;
+  }
+
+  // OTEL collector env vars (tell the agent where to send traces)
+  if (useOtelSidecar && otelEnvVars) {
+    Object.assign(env, otelEnvVars);
   }
 
   for (const [key, val] of Object.entries(env)) {
@@ -407,7 +452,8 @@ export class LocalDeployer implements Deployer {
     const workspaceDir = `/home/node/.openclaw/workspace-${agentId}`;
 
     // Build init script: write config + workspace files on first deploy
-    const ocConfig = buildOpenClawConfig(config);
+    const gatewayToken = generateToken();
+    const ocConfig = buildOpenClawConfig(config, gatewayToken);
     const agentsMd = buildDefaultAgentsMd(config);
     const agentJson = buildAgentJson(config);
 
@@ -503,8 +549,9 @@ something that requires the user's attention.`;
       `test -f '${workspaceDir}/HEARTBEAT.md' || cat > '${workspaceDir}/HEARTBEAT.md' << 'HBEOF'\n${heartbeatMd}\nHBEOF`,
       `test -f '${workspaceDir}/MEMORY.md' || cat > '${workspaceDir}/MEMORY.md' << 'MEMEOF'\n${memoryMd}\nMEMEOF`,
       // If user provided agent source files via mount, copy them in (overrides defaults)
-      `if [ -d /tmp/agent-source/agents ]; then cp -r /tmp/agent-source/agents/* /home/node/.openclaw/ 2>/dev/null || true; fi`,
+      `if [ -d /tmp/agent-source/workspace-${agentId} ]; then cp -r /tmp/agent-source/workspace-${agentId}/* '${workspaceDir}/' 2>/dev/null || true; fi`,
       `if [ -d /tmp/agent-source/skills ]; then cp -r /tmp/agent-source/skills/* /home/node/.openclaw/skills/ 2>/dev/null || true; fi`,
+      `if [ -f /tmp/agent-source/cron/jobs.json ]; then mkdir -p /home/node/.openclaw/cron && cp /tmp/agent-source/cron/jobs.json /home/node/.openclaw/cron/jobs.json 2>/dev/null || true; fi`,
     ].join("\n");
 
     const initArgs = [
@@ -516,10 +563,7 @@ something that requires the user's attention.`;
     // Auto-detect only works when running directly (not containerized), because
     // the path must be valid on the container host, not inside the installer container.
     const isContainerized = existsSync("/.dockerenv") || existsSync("/run/.containerenv");
-    const agentSourceDir = config.agentSourceDir
-      || (!isContainerized && existsSync(join(homedir(), ".openclaw-installer", "agents"))
-        ? join(homedir(), ".openclaw-installer", "agents")
-        : null);
+    const agentSourceDir = config.agentSourceDir || defaultAgentSourceDir(isContainerized);
 
     if (agentSourceDir) {
       initArgs.push("-v", `${agentSourceDir}:/tmp/agent-source:ro`);
@@ -599,14 +643,18 @@ something that requires the user's attention.`;
         // Create a pod with the published port
         const pod = podName(config);
         await runCommand(runtime, ["pod", "rm", "-f", pod], () => {});
+        const podPorts = [
+          "-p", `${port}:18789`,
+          "-p", `${port + 1}:${LITELLM_PORT}`,
+          ...(config.otelJaeger ? ["-p", `${JAEGER_UI_PORT}:${JAEGER_UI_PORT}`] : []),
+        ];
         const podResult = await runCommand(runtime, [
           "pod", "create",
           "--name", pod,
-          "-p", `${port}:18789`,
-          "-p", `${port + 1}:${LITELLM_PORT}`,
+          ...podPorts,
         ], log);
         if (podResult.code !== 0) {
-          throw new Error("Failed to create pod for LiteLLM sidecar");
+          throw new Error("Failed to create pod for sidecars");
         }
 
         // Start LiteLLM in the pod
@@ -664,7 +712,7 @@ something that requires the user's attention.`;
 
     // Save agent files to host so user can edit and re-deploy
     try {
-      const hostAgentsDir = join(homedir(), ".openclaw-installer", "agents", `workspace-${agentId}`);
+      const hostAgentsDir = agentWorkspaceDir(agentId);
       await mkdir(hostAgentsDir, { recursive: true });
       const filesToSave: Record<string, string> = {
         "AGENTS.md": agentsMd,
@@ -691,7 +739,38 @@ something that requires the user's attention.`;
       log("Could not save agent files to host (directory may not be writable)");
     }
 
-    const runArgs = buildRunArgs(config, runtime, name, port, litellmMasterKey);
+    // Create pod for OTEL sidecars if LiteLLM didn't already create one
+    const useOtelSidecars = shouldUseOtel(config);
+    if (useOtelSidecars && !useProxy && runtime === "podman") {
+      const pod = podName(config);
+      await runCommand(runtime, ["pod", "rm", "-f", pod], () => {});
+      const podPorts = [
+        "-p", `${port}:18789`,
+        ...(config.otelJaeger ? ["-p", `${JAEGER_UI_PORT}:${JAEGER_UI_PORT}`] : []),
+      ];
+      await runCommand(runtime, [
+        "pod", "create", "--name", pod, ...podPorts,
+      ], log);
+    }
+
+    // Start Jaeger sidecar before OTEL collector (collector exports to Jaeger)
+    if (config.otelJaeger) {
+      await startJaegerSidecar(
+        config, runtime, podName(config), log, runCommand,
+        (rt, nm) => removeContainer(rt as ContainerRuntime, nm),
+      );
+    }
+
+    // Start OTEL collector sidecar if enabled
+    const otelEnv = await startOtelSidecar(
+      config, runtime, vol,
+      (useProxy || useOtelSidecars) ? podName(config) : null,
+      useProxy ? litellmContainerName(config) : null,
+      port, image, log, runCommand,
+      (rt, nm) => removeContainer(rt as ContainerRuntime, nm),
+    );
+
+    const runArgs = buildRunArgs(config, runtime, name, port, litellmMasterKey, otelEnv);
 
     log(`Starting OpenClaw container: ${name}`);
     const run = await runCommand(runtime, runArgs, log);
@@ -701,20 +780,27 @@ something that requires the user's attention.`;
 
     log("");
     log("=== Container Info ===");
-    if (useProxy) {
+    const hasSidecars = useProxy || !!otelEnv;
+    if (hasSidecars) {
       const isPodman = runtime === "podman";
       if (isPodman) {
         log(`Pod:              ${podName(config)}`);
       }
       log(`Gateway container: ${name}`);
-      log(`LiteLLM container: ${litellmContainerName(config)}`);
+      if (useProxy) log(`LiteLLM container: ${litellmContainerName(config)}`);
+      if (otelEnv) log(`OTEL container:    ${otelContainerName(config)}`);
+      if (config.otelJaeger) log(`Jaeger container:  ${jaegerContainerName(config)}`);
+      log("");
+      if (config.otelJaeger) log(`Jaeger UI: http://localhost:${JAEGER_UI_PORT}`);
       log("");
       log("Useful commands:");
       if (isPodman) {
         log(`  ${runtime} pod ps                          # list pods`);
       }
       log(`  ${runtime} logs ${name}          # gateway logs`);
-      log(`  ${runtime} logs ${litellmContainerName(config)}  # LiteLLM proxy logs`);
+      if (useProxy) log(`  ${runtime} logs ${litellmContainerName(config)}  # LiteLLM proxy logs`);
+      if (otelEnv) log(`  ${runtime} logs ${otelContainerName(config)}  # OTEL collector logs`);
+      if (config.otelJaeger) log(`  ${runtime} logs ${jaegerContainerName(config)}  # Jaeger logs`);
     } else {
       log(`Container: ${name}`);
       log("");
@@ -723,12 +809,13 @@ something that requires the user's attention.`;
     }
 
     // Extract and save gateway token to host filesystem
-    await this.saveInstanceInfo(runtime, name, config, log);
+    await this.saveInstanceInfo(runtime, name, config, log, gatewayToken);
 
     const token = await this.readSavedToken(name);
     const url = `http://localhost:${port}`;
     if (token) {
-      log(`OpenClaw running at ${url}#token=${encodeURIComponent(token)}`);
+      log(`OpenClaw running at ${url}`);
+      log("Use the Open action from the Instances page to open with the saved token");
     } else {
       log(`OpenClaw running at ${url}`);
     }
@@ -755,10 +842,7 @@ something that requires the user's attention.`;
     // Copy updated agent files from host into volume before starting
     const isContainerized = existsSync("/.dockerenv") || existsSync("/run/.containerenv");
     const agentId = `${result.config.prefix || "openclaw"}_${result.config.agentName}`;
-    const agentSourceDir = result.config.agentSourceDir
-      || (!isContainerized && existsSync(join(homedir(), ".openclaw-installer", "agents"))
-        ? join(homedir(), ".openclaw-installer", "agents")
-        : null);
+    const agentSourceDir = result.config.agentSourceDir || defaultAgentSourceDir(isContainerized);
 
     if (agentSourceDir && existsSync(join(agentSourceDir, `workspace-${agentId}`))) {
       log("Updating agent files from host...");
@@ -766,6 +850,7 @@ something that requires the user's attention.`;
       const copyScript = [
         `cp /tmp/agent-source/workspace-${agentId}/* '${workspaceDir}/' 2>/dev/null || true`,
         `if [ -d /tmp/agent-source/skills ]; then mkdir -p /home/node/.openclaw/skills && cp -r /tmp/agent-source/skills/* /home/node/.openclaw/skills/ 2>/dev/null || true; fi`,
+        `if [ -f /tmp/agent-source/cron/jobs.json ]; then mkdir -p /home/node/.openclaw/cron && cp /tmp/agent-source/cron/jobs.json /home/node/.openclaw/cron/jobs.json 2>/dev/null || true; fi`,
       ].join("\n");
 
       await runCommand(runtime, [
@@ -814,10 +899,14 @@ something that requires the user's attention.`;
       if (isPodman) {
         const pod = podName(result.config);
         await runCommand(runtime, ["pod", "rm", "-f", pod], () => {});
-        await runCommand(runtime, [
-          "pod", "create", "--name", pod,
+        const podPorts = [
           "-p", `${port}:18789`,
           "-p", `${port + 1}:${LITELLM_PORT}`,
+          ...(result.config.otelJaeger ? ["-p", `${JAEGER_UI_PORT}:${JAEGER_UI_PORT}`] : []),
+        ];
+        await runCommand(runtime, [
+          "pod", "create", "--name", pod,
+          ...podPorts,
         ], log);
 
         await runCommand(runtime, [
@@ -860,8 +949,39 @@ something that requires the user's attention.`;
       }
     }
 
+    // Create pod for OTEL sidecars if LiteLLM didn't already create one
+    const useOtelSidecars = shouldUseOtel(result.config);
+    if (useOtelSidecars && !useProxy && runtime === "podman") {
+      const pod = podName(result.config);
+      await runCommand(runtime, ["pod", "rm", "-f", pod], () => {});
+      const podPorts = [
+        "-p", `${port}:18789`,
+        ...(result.config.otelJaeger ? ["-p", `${JAEGER_UI_PORT}:${JAEGER_UI_PORT}`] : []),
+      ];
+      await runCommand(runtime, [
+        "pod", "create", "--name", pod, ...podPorts,
+      ], log);
+    }
+
+    // Restart Jaeger sidecar if enabled
+    if (result.config.otelJaeger) {
+      await startJaegerSidecar(
+        result.config, runtime, podName(result.config), log, runCommand,
+        (rt, nm) => removeContainer(rt as ContainerRuntime, nm),
+      );
+    }
+
+    // Restart OTEL sidecar if enabled
+    const otelEnv = await startOtelSidecar(
+      result.config, runtime, vol,
+      (useProxy || useOtelSidecars) ? podName(result.config) : null,
+      useProxy ? litellmContainerName(result.config) : null,
+      port, image, log, runCommand,
+      (rt, nm) => removeContainer(rt as ContainerRuntime, nm),
+    );
+
     log(`Starting OpenClaw container: ${name}`);
-    const runArgs = buildRunArgs(result.config, runtime, name, port, litellmMasterKey);
+    const runArgs = buildRunArgs(result.config, runtime, name, port, litellmMasterKey, otelEnv);
     const run = await runCommand(runtime, runArgs, log);
     if (run.code !== 0) {
       throw new Error("Failed to start container");
@@ -872,7 +992,8 @@ something that requires the user's attention.`;
     const token = await this.readSavedToken(name);
     const url = `http://localhost:${port}`;
     if (token) {
-      log(`OpenClaw running at ${url}#token=${encodeURIComponent(token)}`);
+      log(`OpenClaw running at ${url}`);
+      log("Use the Open action from the Instances page to open with the saved token");
     } else {
       log(`OpenClaw running at ${url}`);
     }
@@ -898,7 +1019,7 @@ something that requires the user's attention.`;
 
   private async readSavedToken(name: string): Promise<string | null> {
     try {
-      const tokenPath = join(homedir(), ".openclaw-installer", "local", name, "gateway-token");
+      const tokenPath = join(installerLocalInstanceDir(name), "gateway-token");
       const token = (await readFile(tokenPath, "utf8")).trim();
       return token || null;
     } catch {
@@ -908,7 +1029,7 @@ something that requires the user's attention.`;
 
   /**
    * Extract instance info from running container and save to
-   * ~/.openclaw-installer/local/<name>/ on the host:
+   * ~/.openclaw/installer/local/<name>/ on the host:
    *   - gateway-token (auth token)
    *   - .env (all env vars for the instance, secrets redacted with comment)
    */
@@ -917,8 +1038,9 @@ something that requires the user's attention.`;
     name: string,
     config: DeployConfig,
     log: LogCallback,
+    precomputedToken?: string,
   ): Promise<void> {
-    const instanceDir = join(homedir(), ".openclaw-installer", "local", name);
+    const instanceDir = installerLocalInstanceDir(name);
     try {
       await mkdir(instanceDir, { recursive: true });
     } catch {
@@ -931,14 +1053,17 @@ something that requires the user's attention.`;
 
     // Save gateway token
     try {
-      const { stdout } = await execFileAsync(runtime, [
-        "exec",
-        name,
-        "node",
-        "-e",
-        "const c=JSON.parse(require('fs').readFileSync('/home/node/.openclaw/openclaw.json','utf8'));console.log(c.gateway?.auth?.token||'')",
-      ]);
-      const token = stdout.trim();
+      let token = precomputedToken?.trim() || "";
+      if (!token) {
+        const { stdout } = await execFileAsync(runtime, [
+          "exec",
+          name,
+          "node",
+          "-e",
+          "const c=JSON.parse(require('fs').readFileSync('/home/node/.openclaw/openclaw.json','utf8'));console.log(c.gateway?.auth?.token||'')",
+        ]);
+        token = stdout.trim();
+      }
       if (token) {
         const tokenPath = join(instanceDir, "gateway-token");
         await writeFile(tokenPath, token + "\n", { mode: 0o600 });
@@ -996,6 +1121,21 @@ something that requires the user's attention.`;
       if (config.agentSourceDir) {
         lines.push(`AGENT_SOURCE_DIR=${config.agentSourceDir}`);
       }
+      if (config.otelEnabled) {
+        lines.push(`OTEL_ENABLED=true`);
+        if (config.otelJaeger) {
+          lines.push(`OTEL_JAEGER=true`);
+        }
+        if (config.otelEndpoint) {
+          lines.push(`OTEL_ENDPOINT=${config.otelEndpoint}`);
+        }
+        if (config.otelExperimentId) {
+          lines.push(`OTEL_EXPERIMENT_ID=${config.otelExperimentId}`);
+        }
+        if (config.otelImage) {
+          lines.push(`OTEL_IMAGE=${config.otelImage}`);
+        }
+      }
       if (config.telegramBotToken) {
         lines.push(`TELEGRAM_BOT_TOKEN=${config.telegramBotToken}`);
       }
@@ -1026,13 +1166,10 @@ something that requires the user's attention.`;
     const workspaceDir = `/home/node/.openclaw/workspace-${agentId}`;
 
     const isContainerized = existsSync("/.dockerenv") || existsSync("/run/.containerenv");
-    const agentSourceDir = result.config.agentSourceDir
-      || (!isContainerized && existsSync(join(homedir(), ".openclaw-installer", "agents"))
-        ? join(homedir(), ".openclaw-installer", "agents")
-        : null);
+    const agentSourceDir = result.config.agentSourceDir || defaultAgentSourceDir(isContainerized);
 
     if (!agentSourceDir) {
-      log("No agent source directory found at ~/.openclaw-installer/agents/");
+      log("No agent source directory found at ~/.openclaw/");
       return;
     }
 
@@ -1046,6 +1183,10 @@ something that requires the user's attention.`;
       `if [ -d /tmp/agent-source/skills ]; then`,
       `  mkdir -p /home/node/.openclaw/skills`,
       `  cp -rv /tmp/agent-source/skills/* /home/node/.openclaw/skills/ 2>/dev/null || true`,
+      `fi`,
+      `if [ -f /tmp/agent-source/cron/jobs.json ]; then`,
+      `  mkdir -p /home/node/.openclaw/cron`,
+      `  cp -v /tmp/agent-source/cron/jobs.json /home/node/.openclaw/cron/jobs.json 2>/dev/null || true`,
       `fi`,
     ].join("\n");
 
@@ -1112,6 +1253,9 @@ something that requires the user's attention.`;
       // No sidecar running
     }
 
+    // Stop OTEL sidecar if it exists
+    await stopOtelSidecar(result.config, runtime, log, runCommand);
+
     // Remove podman pod if it exists
     if (isPodman) {
       const pod = podName(result.config);
@@ -1134,9 +1278,11 @@ something that requires the user's attention.`;
     // Stop gateway container
     await removeContainer(runtime, name);
 
-    // Stop LiteLLM sidecar
+    // Stop sidecars
     const litellmName = litellmContainerName(result.config);
     await removeContainer(runtime, litellmName);
+    await removeContainer(runtime, otelContainerName(result.config));
+    await removeContainer(runtime, jaegerContainerName(result.config));
 
     // Remove podman pod if it exists
     if (isPodman) {

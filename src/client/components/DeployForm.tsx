@@ -89,6 +89,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
   const [deploying, setDeploying] = useState(false);
   const [defaults, setDefaults] = useState<ServerDefaults | null>(null);
   const [savedConfigs, setSavedConfigs] = useState<SavedConfig[]>([]);
+  const [loadedConfigLabel, setLoadedConfigLabel] = useState<string | null>(null);
   const [inferenceProvider, setInferenceProvider] = useState<InferenceProvider>("anthropic");
   const [config, setConfig] = useState({
     prefix: "",
@@ -118,6 +119,11 @@ export default function DeployForm({ onDeployStarted }: Props) {
     namespace: "",
     // LiteLLM proxy
     litellmProxy: true,
+    // OTEL tracing
+    otelEnabled: false,
+    otelJaeger: false,
+    otelEndpoint: "",
+    otelExperimentId: "",
   });
 
   const [gcpDefaults, setGcpDefaults] = useState<GcpDefaults | null>(null);
@@ -169,14 +175,11 @@ export default function DeployForm({ onDeployStarted }: Props) {
       })
       .catch(() => {});
 
-    // Load saved configs from ~/.openclaw-installer/
+    // Load saved configs from ~/.openclaw/installer/
     fetch("/api/configs")
       .then((r) => r.json())
       .then((configs: SavedConfig[]) => {
         setSavedConfigs(configs);
-        if (configs.length > 0) {
-          applyVars(configs[0].vars);
-        }
       })
       .catch(() => {});
   }, []);
@@ -213,6 +216,11 @@ export default function DeployForm({ onDeployStarted }: Props) {
       telegramBotToken: v("TELEGRAM_BOT_TOKEN", "telegramBotToken") || prev.telegramBotToken,
       telegramAllowFrom: v("TELEGRAM_ALLOW_FROM", "telegramAllowFrom") || prev.telegramAllowFrom,
       litellmProxy: vars.litellmProxy === "false" ? false : prev.litellmProxy,
+      otelEnabled: vars.OTEL_ENABLED === "true" || vars.otelEnabled === "true" || prev.otelEnabled,
+      otelJaeger: vars.OTEL_JAEGER === "true" || vars.otelJaeger === "true" || prev.otelJaeger,
+      otelEndpoint: v("OTEL_ENDPOINT", "otelEndpoint") || prev.otelEndpoint,
+      otelExperimentId: v("OTEL_EXPERIMENT_ID", "otelExperimentId") || prev.otelExperimentId,
+      otelImage: v("OTEL_IMAGE", "otelImage") || prev.otelImage,
     }));
   };
 
@@ -266,6 +274,10 @@ export default function DeployForm({ onDeployStarted }: Props) {
         telegramEnabled: config.telegramEnabled || undefined,
         telegramBotToken: config.telegramEnabled ? config.telegramBotToken || undefined : undefined,
         telegramAllowFrom: config.telegramEnabled ? config.telegramAllowFrom || undefined : undefined,
+        otelEnabled: config.otelEnabled || undefined,
+        otelJaeger: config.otelEnabled ? config.otelJaeger || undefined : undefined,
+        otelEndpoint: config.otelEnabled ? config.otelEndpoint || undefined : undefined,
+        otelExperimentId: config.otelEnabled ? config.otelExperimentId || undefined : undefined,
       };
 
       const res = await fetch("/api/deploy", {
@@ -362,6 +374,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
                   if (cfg) {
                     setMode(cfg.type === "k8s" ? "kubernetes" : "local");
                     applyVars(cfg.vars);
+                    setLoadedConfigLabel(`${cfg.name} (${cfg.type === "k8s" ? "K8s" : "Local"})`);
                   }
                 }}
                 defaultValue=""
@@ -383,6 +396,22 @@ export default function DeployForm({ onDeployStarted }: Props) {
             </label>
           </div>
         </div>
+
+        {loadedConfigLabel && (
+          <div
+            style={{
+              marginBottom: "1rem",
+              padding: "0.75rem 1rem",
+              border: "1px solid var(--border)",
+              borderRadius: "0.75rem",
+              background: "var(--bg-secondary)",
+              fontSize: "0.9rem",
+              color: "var(--text-secondary)",
+            }}
+          >
+            Loaded saved config: <strong style={{ color: "var(--text-primary)" }}>{loadedConfigLabel}</strong>
+          </div>
+        )}
 
         <div className="form-row">
           <div className="form-group">
@@ -462,8 +491,8 @@ export default function DeployForm({ onDeployStarted }: Props) {
               onChange={(e) => update("agentSourceDir", e.target.value)}
             />
             <div className="hint">
-              Host directory with <code>agents/</code> and <code>skills/</code> subdirs to provision into the workspace.
-              Defaults to <code>~/.openclaw-installer/agents/</code> if it exists.
+              Host directory with <code>workspace-*</code>, <code>skills/</code>, and <code>cron/jobs.json</code> to provision into the instance.
+              Defaults to <code>~/.openclaw/</code> if it exists.
             </div>
           </div>
         )}
@@ -788,6 +817,74 @@ export default function DeployForm({ onDeployStarted }: Props) {
                 : `Leave blank for default${MODEL_DEFAULTS[inferenceProvider] ? ` (${MODEL_DEFAULTS[inferenceProvider]})` : ""}. ${MODEL_HINTS[inferenceProvider]}`}
           </div>
         </div>
+
+        <h3 style={{ marginTop: "1.5rem" }}>Observability</h3>
+
+        <div className="form-group">
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <input
+              type="checkbox"
+              checked={config.otelEnabled}
+              onChange={(e) =>
+                setConfig((prev) => ({ ...prev, otelEnabled: e.target.checked }))
+              }
+              style={{ width: "auto" }}
+            />
+            Enable OTEL trace collection
+          </label>
+          <div className="hint">
+            Runs an OpenTelemetry Collector sidecar that exports traces to Jaeger, MLflow, Grafana Tempo, or any OTLP-compatible backend
+          </div>
+        </div>
+
+        {config.otelEnabled && (
+          <>
+            {mode === "local" && (
+              <div className="form-group">
+                <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={config.otelJaeger}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, otelJaeger: e.target.checked }))
+                    }
+                    style={{ width: "auto" }}
+                  />
+                  Include Jaeger all-in-one (trace viewer)
+                </label>
+                <div className="hint">
+                  Runs Jaeger as a sidecar — no external setup needed. UI at http://localhost:16686
+                </div>
+              </div>
+            )}
+            <div className="form-group">
+              <label>OTLP Endpoint {config.otelJaeger && "(optional — defaults to in-pod Jaeger)"}</label>
+              <input
+                type="text"
+                placeholder={config.otelJaeger ? "Leave blank to use Jaeger sidecar" : "http://jaeger-collector:4317 or http://mlflow:5000"}
+                value={config.otelEndpoint}
+                onChange={(e) => update("otelEndpoint", e.target.value)}
+              />
+              <div className="hint">
+                {config.otelJaeger
+                  ? "Override to send traces to an external backend instead of (or in addition to) the local Jaeger"
+                  : "OTLP gRPC (port 4317) or HTTP (any other port) endpoint. Use gRPC for Jaeger, HTTP for MLflow / Tempo."}
+              </div>
+            </div>
+            <div className="form-group">
+              <label>MLflow Experiment ID (optional)</label>
+              <input
+                type="text"
+                placeholder="0"
+                value={config.otelExperimentId}
+                onChange={(e) => update("otelExperimentId", e.target.value)}
+              />
+              <div className="hint">
+                Only needed for MLflow endpoints. Sets the x-mlflow-experiment-id header on exported traces.
+              </div>
+            </div>
+          </>
+        )}
 
         <h3 style={{ marginTop: "1.5rem" }}>Channels</h3>
 

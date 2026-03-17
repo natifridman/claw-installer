@@ -2,13 +2,14 @@ import * as k8s from "@kubernetes/client-node";
 import {
   DEFAULT_IMAGE,
   agentId,
-  deriveModel,
   tryParseProjectId,
   buildOpenClawConfig,
 } from "./k8s-helpers.js";
 import { oauthProxyContainer } from "./k8s-oauth.js";
 import type { DeployConfig } from "./types.js";
 import { shouldUseLitellmProxy, LITELLM_IMAGE, LITELLM_PORT } from "./litellm.js";
+import { shouldUseOtel, OTEL_COLLECTOR_IMAGE, OTEL_GRPC_PORT, OTEL_HTTP_PORT, otelAgentEnv } from "./otel.js";
+import type { TreeEntry } from "../state-tree.js";
 
 export function namespaceManifest(ns: string): k8s.V1Namespace {
   return {
@@ -62,6 +63,32 @@ export function agentConfigMapManifest(ns: string, config: DeployConfig, workspa
   };
 }
 
+export function fileTreeConfigMapManifest(ns: string, name: string, entries: TreeEntry[]): k8s.V1ConfigMap {
+  return {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name,
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    data: Object.fromEntries(entries.map((entry) => [entry.key, entry.content])),
+  };
+}
+
+export function fileConfigMapManifest(ns: string, name: string, filename: string, content?: string): k8s.V1ConfigMap {
+  return {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name,
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    data: content !== undefined ? { [filename]: content } : {},
+  };
+}
+
 export function gcpSaSecretManifest(ns: string, saJson: string): k8s.V1Secret {
   return {
     apiVersion: "v1",
@@ -81,6 +108,19 @@ export function litellmConfigMapManifest(ns: string, configYaml: string): k8s.V1
     kind: "ConfigMap",
     metadata: {
       name: "litellm-config",
+      namespace: ns,
+      labels: { app: "openclaw" },
+    },
+    data: { "config.yaml": configYaml },
+  };
+}
+
+export function otelConfigMapManifest(ns: string, configYaml: string): k8s.V1ConfigMap {
+  return {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name: "otel-collector-config",
       namespace: ns,
       labels: { app: "openclaw" },
     },
@@ -144,7 +184,14 @@ export function serviceManifest(ns: string, onOpenShift: boolean): k8s.V1Service
   };
 }
 
-export function deploymentManifest(ns: string, config: DeployConfig, onOpenShift: boolean): k8s.V1Deployment {
+export function deploymentManifest(
+  ns: string,
+  config: DeployConfig,
+  onOpenShift: boolean,
+  otelViaOperator = false,
+  skillEntries: TreeEntry[] = [],
+  cronJobsContent?: string,
+): k8s.V1Deployment {
   const image = config.image || DEFAULT_IMAGE;
   const id = agentId(config);
 
@@ -175,6 +222,16 @@ export function deploymentManifest(ns: string, config: DeployConfig, onOpenShift
   }
 
   const useProxy = shouldUseLitellmProxy(config);
+  const useOtel = shouldUseOtel(config);
+  // Direct sidecar only when OTEL is enabled and operator is NOT handling it
+  const useOtelDirect = useOtel && !otelViaOperator;
+
+  // OTEL collector env vars (tell the agent where to send traces)
+  if (useOtel) {
+    for (const [key, val] of Object.entries(otelAgentEnv())) {
+      envVars.push({ name: key, value: val });
+    }
+  }
 
   if (config.vertexEnabled && useProxy) {
     // LiteLLM proxy mode: provider config in openclaw.json points to the sidecar,
@@ -205,6 +262,8 @@ mkdir -p /home/node/.openclaw/skills
 mkdir -p /home/node/.openclaw/cron
 mkdir -p /home/node/.openclaw/workspace-${id}
 ${copyLines}
+cp -r /skills-src/. /home/node/.openclaw/skills/ 2>/dev/null || true
+cp /cron-src/jobs.json /home/node/.openclaw/cron/jobs.json 2>/dev/null || true
 chgrp -R 0 /home/node/.openclaw 2>/dev/null || true
 chmod -R g=u /home/node/.openclaw 2>/dev/null || true
 echo "Config initialized"
@@ -230,7 +289,11 @@ echo "Config initialized"
       template: {
         metadata: {
           labels: { app: "openclaw" },
-          annotations: { "openclaw.io/restart-at": new Date().toISOString() },
+          annotations: {
+            "openclaw.io/restart-at": new Date().toISOString(),
+            // When OTel Operator is available, it injects the collector sidecar
+            ...(otelViaOperator ? { "sidecar.opentelemetry.io/inject": "openclaw-sidecar" } : {}),
+          },
         },
         spec: {
           ...(onOpenShift ? { serviceAccountName: "openclaw-oauth-proxy" } : {}),
@@ -248,6 +311,8 @@ echo "Config initialized"
                 { name: "openclaw-home", mountPath: "/home/node/.openclaw" },
                 { name: "config-template", mountPath: "/config" },
                 { name: "agent-config", mountPath: "/agents" },
+                { name: "skills-config", mountPath: "/skills-src", readOnly: true },
+                { name: "cron-config", mountPath: "/cron-src", readOnly: true },
               ],
             },
           ],
@@ -339,11 +404,52 @@ echo "Config initialized"
                 capabilities: { drop: ["ALL"] },
               },
             }] : []),
+            // OTEL collector sidecar: receives OTLP traces and exports to configured backend
+            ...(useOtelDirect ? [{
+              name: "otel-collector",
+              image: config.otelImage || OTEL_COLLECTOR_IMAGE,
+              imagePullPolicy: "IfNotPresent" as const,
+              args: ["--config", "/etc/otel/config.yaml"],
+              ports: [
+                { name: "otlp-grpc", containerPort: OTEL_GRPC_PORT, protocol: "TCP" as const },
+                { name: "otlp-http", containerPort: OTEL_HTTP_PORT, protocol: "TCP" as const },
+              ],
+              volumeMounts: [
+                { name: "otel-config", mountPath: "/etc/otel", readOnly: true },
+              ],
+              resources: {
+                requests: { memory: "128Mi", cpu: "100m" },
+                limits: { memory: "256Mi", cpu: "200m" },
+              },
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                readOnlyRootFilesystem: true,
+                capabilities: { drop: ["ALL"] },
+              },
+            }] : []),
           ],
           volumes: [
             { name: "openclaw-home", persistentVolumeClaim: { claimName: "openclaw-home-pvc" } },
             { name: "config-template", configMap: { name: "openclaw-config" } },
             { name: "agent-config", configMap: { name: "openclaw-agent" } },
+            {
+              name: "skills-config",
+              configMap: {
+                name: "openclaw-skills",
+                ...(skillEntries.length > 0
+                  ? { items: skillEntries.map((entry) => ({ key: entry.key, path: entry.path })) }
+                  : {}),
+              },
+            },
+            {
+              name: "cron-config",
+              configMap: {
+                name: "openclaw-cron",
+                ...(cronJobsContent !== undefined
+                  ? { items: [{ key: "jobs.json", path: "jobs.json" }] }
+                  : {}),
+              },
+            },
             { name: "tmp-volume", emptyDir: {} },
             ...(config.gcpServiceAccountJson
               ? [{ name: "gcp-sa", secret: { secretName: "gcp-sa" } }]
@@ -353,6 +459,9 @@ echo "Config initialized"
                   { name: "litellm-config", configMap: { name: "litellm-config" } },
                   { name: "litellm-tmp", emptyDir: {} },
                 ]
+              : []),
+            ...(useOtelDirect
+              ? [{ name: "otel-config", configMap: { name: "otel-collector-config" } }]
               : []),
             ...(onOpenShift ? [
               { name: "oauth-config", secret: { secretName: "openclaw-oauth-config" } },

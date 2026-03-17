@@ -1,19 +1,22 @@
-name: Build and Push OpenClaw Image
+name: Build and Push OpenClaw Vertex Image
 
 on:
-  schedule:
-    - cron: '0 3 * * *'  # Nightly at 3:00 UTC
   push:
     branches: [main]
     paths:
       - 'Dockerfile.openclaw'
+      - '.github/workflows/build-openclaw-vertex-image.yml'
   pull_request:
     paths:
       - 'Dockerfile.openclaw'
+      - '.github/workflows/build-openclaw-vertex-image.yml'
   workflow_dispatch:
 
 env:
   IMAGE: quay.io/aicatalyst/openclaw
+  TAG: vertex-anthropic
+  OPENCLAW_REPO: https://github.com/sallyom/openclaw.git
+  OPENCLAW_REF: pi-vertex-testbranch
 
 jobs:
   build:
@@ -23,17 +26,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Set image tags
-        id: tags
-        run: |
-          DATE_TAG="$(date -u +%Y%m%d)"
-          SHA_TAG="${GITHUB_SHA::7}"
-          TAGS="${IMAGE}:latest,${IMAGE}:${DATE_TAG}-${SHA_TAG}"
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAGS="${TAGS},${IMAGE}:${GITHUB_REF_NAME}"
-          fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -56,6 +48,9 @@ jobs:
           file: ./Dockerfile.openclaw
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          build-args: |
+            OPENCLAW_REPO=${{ env.OPENCLAW_REPO }}
+            OPENCLAW_REF=${{ env.OPENCLAW_REF }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
