@@ -55,6 +55,24 @@ function containerToInstance(c: DiscoveredContainer): DeployResult {
   };
 }
 
+function decodeSavedBase64(value?: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return Buffer.from(value, "base64").toString("utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeSavedBase64UnlessPath(savedValue?: string, savedPath?: string): string | undefined {
+  if (savedPath?.trim()) {
+    return undefined;
+  }
+  return decodeSavedBase64(savedValue);
+}
+
 // List all instances: running containers + stopped volumes (no container due to --rm) + K8s
 router.get("/", async (_req, res) => {
   const instances: DeployResult[] = [];
@@ -91,6 +109,47 @@ router.get("/", async (_req, res) => {
           openaiApiKey: savedVars.OPENAI_API_KEY || undefined,
           telegramBotToken: savedVars.TELEGRAM_BOT_TOKEN || undefined,
           telegramAllowFrom: savedVars.TELEGRAM_ALLOW_FROM || undefined,
+          sandboxEnabled: savedVars.SANDBOX_ENABLED === "true" || undefined,
+          sandboxBackend: (savedVars.SANDBOX_BACKEND as "ssh") || undefined,
+          sandboxMode:
+            (savedVars.SANDBOX_MODE as "off" | "non-main" | "all") || undefined,
+          sandboxScope:
+            (savedVars.SANDBOX_SCOPE as "session" | "agent" | "shared") || undefined,
+          sandboxToolPolicyEnabled:
+            savedVars.SANDBOX_TOOL_POLICY_ENABLED === "true" || undefined,
+          sandboxToolAllowFiles:
+            savedVars.SANDBOX_TOOL_ALLOW_FILES === "false" ? false : undefined,
+          sandboxToolAllowSessions:
+            savedVars.SANDBOX_TOOL_ALLOW_SESSIONS === "false" ? false : undefined,
+          sandboxToolAllowMemory:
+            savedVars.SANDBOX_TOOL_ALLOW_MEMORY === "false" ? false : undefined,
+          sandboxToolAllowRuntime:
+            savedVars.SANDBOX_TOOL_ALLOW_RUNTIME === "true" || undefined,
+          sandboxToolAllowBrowser:
+            savedVars.SANDBOX_TOOL_ALLOW_BROWSER === "true" || undefined,
+          sandboxToolAllowAutomation:
+            savedVars.SANDBOX_TOOL_ALLOW_AUTOMATION === "true" || undefined,
+          sandboxToolAllowMessaging:
+            savedVars.SANDBOX_TOOL_ALLOW_MESSAGING === "true" || undefined,
+          sandboxWorkspaceAccess:
+            (savedVars.SANDBOX_WORKSPACE_ACCESS as "none" | "ro" | "rw") || undefined,
+          sandboxSshTarget: savedVars.SANDBOX_SSH_TARGET || undefined,
+          sandboxSshWorkspaceRoot: savedVars.SANDBOX_SSH_WORKSPACE_ROOT || undefined,
+          sandboxSshIdentityPath: savedVars.SANDBOX_SSH_IDENTITY_PATH || undefined,
+          sandboxSshCertificatePath: savedVars.SANDBOX_SSH_CERTIFICATE_PATH || undefined,
+          sandboxSshKnownHostsPath: savedVars.SANDBOX_SSH_KNOWN_HOSTS_PATH || undefined,
+          sandboxSshStrictHostKeyChecking:
+            savedVars.SANDBOX_SSH_STRICT_HOST_KEY_CHECKING === "false" ? false : undefined,
+          sandboxSshUpdateHostKeys:
+            savedVars.SANDBOX_SSH_UPDATE_HOST_KEYS === "false" ? false : undefined,
+          sandboxSshCertificate: decodeSavedBase64UnlessPath(
+            savedVars.SANDBOX_SSH_CERTIFICATE_B64,
+            savedVars.SANDBOX_SSH_CERTIFICATE_PATH,
+          ),
+          sandboxSshKnownHosts: decodeSavedBase64UnlessPath(
+            savedVars.SANDBOX_SSH_KNOWN_HOSTS_B64,
+            savedVars.SANDBOX_SSH_KNOWN_HOSTS_PATH,
+          ),
         },
         startedAt: "",
         containerId: vol.containerName,
@@ -576,6 +635,7 @@ async function findInstance(name: string): Promise<DeployResult | null> {
           openaiApiKey: savedVars.OPENAI_API_KEY || undefined,
           agentModel: savedVars.AGENT_MODEL || undefined,
           modelEndpoint: savedVars.MODEL_ENDPOINT || undefined,
+          agentSourceDir: savedVars.AGENT_SOURCE_DIR || undefined,
           vertexEnabled: savedVars.VERTEX_ENABLED === "true" || undefined,
           vertexProvider: (savedVars.VERTEX_PROVIDER as "google" | "anthropic") || undefined,
           googleCloudProject: savedVars.GOOGLE_CLOUD_PROJECT || undefined,
@@ -590,6 +650,47 @@ async function findInstance(name: string): Promise<DeployResult | null> {
           otelImage: savedVars.OTEL_IMAGE || undefined,
           telegramBotToken: savedVars.TELEGRAM_BOT_TOKEN || undefined,
           telegramAllowFrom: savedVars.TELEGRAM_ALLOW_FROM || undefined,
+          sandboxEnabled: savedVars.SANDBOX_ENABLED === "true" || undefined,
+          sandboxBackend: (savedVars.SANDBOX_BACKEND as "ssh") || undefined,
+          sandboxMode:
+            (savedVars.SANDBOX_MODE as "off" | "non-main" | "all") || undefined,
+          sandboxScope:
+            (savedVars.SANDBOX_SCOPE as "session" | "agent" | "shared") || undefined,
+          sandboxToolPolicyEnabled:
+            savedVars.SANDBOX_TOOL_POLICY_ENABLED === "true" || undefined,
+          sandboxToolAllowFiles:
+            savedVars.SANDBOX_TOOL_ALLOW_FILES === "false" ? false : undefined,
+          sandboxToolAllowSessions:
+            savedVars.SANDBOX_TOOL_ALLOW_SESSIONS === "false" ? false : undefined,
+          sandboxToolAllowMemory:
+            savedVars.SANDBOX_TOOL_ALLOW_MEMORY === "false" ? false : undefined,
+          sandboxToolAllowRuntime:
+            savedVars.SANDBOX_TOOL_ALLOW_RUNTIME === "true" || undefined,
+          sandboxToolAllowBrowser:
+            savedVars.SANDBOX_TOOL_ALLOW_BROWSER === "true" || undefined,
+          sandboxToolAllowAutomation:
+            savedVars.SANDBOX_TOOL_ALLOW_AUTOMATION === "true" || undefined,
+          sandboxToolAllowMessaging:
+            savedVars.SANDBOX_TOOL_ALLOW_MESSAGING === "true" || undefined,
+          sandboxWorkspaceAccess:
+            (savedVars.SANDBOX_WORKSPACE_ACCESS as "none" | "ro" | "rw") || undefined,
+          sandboxSshTarget: savedVars.SANDBOX_SSH_TARGET || undefined,
+          sandboxSshWorkspaceRoot: savedVars.SANDBOX_SSH_WORKSPACE_ROOT || undefined,
+          sandboxSshIdentityPath: savedVars.SANDBOX_SSH_IDENTITY_PATH || undefined,
+          sandboxSshCertificatePath: savedVars.SANDBOX_SSH_CERTIFICATE_PATH || undefined,
+          sandboxSshKnownHostsPath: savedVars.SANDBOX_SSH_KNOWN_HOSTS_PATH || undefined,
+          sandboxSshStrictHostKeyChecking:
+            savedVars.SANDBOX_SSH_STRICT_HOST_KEY_CHECKING === "false" ? false : undefined,
+          sandboxSshUpdateHostKeys:
+            savedVars.SANDBOX_SSH_UPDATE_HOST_KEYS === "false" ? false : undefined,
+          sandboxSshCertificate: decodeSavedBase64UnlessPath(
+            savedVars.SANDBOX_SSH_CERTIFICATE_B64,
+            savedVars.SANDBOX_SSH_CERTIFICATE_PATH,
+          ),
+          sandboxSshKnownHosts: decodeSavedBase64UnlessPath(
+            savedVars.SANDBOX_SSH_KNOWN_HOSTS_B64,
+            savedVars.SANDBOX_SSH_KNOWN_HOSTS_PATH,
+          ),
         },
         startedAt: "",
         containerId: name,
