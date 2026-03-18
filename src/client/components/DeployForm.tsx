@@ -84,6 +84,11 @@ const MODEL_HINTS: Record<InferenceProvider, string> = {
   "custom-endpoint": "Specify the model ID served by your endpoint",
 };
 
+const PROXY_MODEL_HINTS: Record<string, string> = {
+  "vertex-anthropic": "Examples: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5",
+  "vertex-google": "Examples: gemini-2.5-pro, gemini-2.5-flash",
+};
+
 export default function DeployForm({ onDeployStarted }: Props) {
   const [mode, setMode] = useState<Mode>("local");
   const [deploying, setDeploying] = useState(false);
@@ -813,7 +818,7 @@ export default function DeployForm({ onDeployStarted }: Props) {
             {config.agentModel
               ? "Custom model override"
               : isVertex && config.litellmProxy
-                ? `Leave blank for default (routed through LiteLLM proxy). ${MODEL_HINTS[inferenceProvider]}`
+                ? `Leave blank for default (routed through LiteLLM proxy). ${PROXY_MODEL_HINTS[inferenceProvider] || MODEL_HINTS[inferenceProvider]}`
                 : `Leave blank for default${MODEL_DEFAULTS[inferenceProvider] ? ` (${MODEL_DEFAULTS[inferenceProvider]})` : ""}. ${MODEL_HINTS[inferenceProvider]}`}
           </div>
         </div>
