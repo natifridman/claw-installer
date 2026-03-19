@@ -41,6 +41,15 @@ const GCP_SA_CONTAINER_PATH = "/home/node/.openclaw/gcp/sa.json";
 const LITELLM_CONFIG_PATH = "/home/node/.openclaw/litellm/config.yaml";
 const LITELLM_KEY_PATH = "/home/node/.openclaw/litellm/master-key";
 
+/** Returns true if the image tag is `:latest` or absent — mutable tags that should always be pulled. */
+export function shouldAlwaysPull(image: string): boolean {
+  // Digest references (image@sha256:...) are immutable — never need to re-pull
+  if (image.includes("@")) return false;
+  const ref = image.split("/").pop() || image;
+  const tag = ref.includes(":") ? ref.split(":").pop() : undefined;
+  return !tag || tag === "latest";
+}
+
 function resolveImage(config: DeployConfig): string {
   if (config.image) return config.image;
   return config.vertexEnabled ? DEFAULT_VERTEX_IMAGE : DEFAULT_IMAGE;
@@ -330,6 +339,7 @@ function buildRunArgs(
   litellmMasterKey?: string,
   otelEnvVars?: Record<string, string>,
 ): string[] {
+  const image = resolveImage(config);
   const useProxy = shouldUseLitellmProxy(config) && !!litellmMasterKey;
   const useOtelSidecar = shouldUseOtel(config) && !!otelEnvVars;
   const hasSidecars = useProxy || useOtelSidecar;
@@ -339,6 +349,8 @@ function buildRunArgs(
     "run",
     "-d",
     "--rm",
+    // For mutable tags (:latest/untagged), check for newer image at startup (Fix for #28)
+    ...(shouldAlwaysPull(image) ? ["--pull=newer"] : []),
     "--name",
     name,
   ];
@@ -438,10 +450,16 @@ export class LocalDeployer implements Deployer {
 
     const image = resolveImage(config);
 
-    // Check if image exists locally before pulling
+    // Pull the image if it doesn't exist locally.
+    // For mutable tags (:latest/untagged), --pull=newer on `podman run` handles
+    // checking for updates efficiently via digest comparison (Fix for #28).
     try {
       await execFileAsync(runtime, ["image", "exists", image]);
-      log(`Using local image: ${image}`);
+      if (shouldAlwaysPull(image)) {
+        log(`Image ${image} found locally; will check for updates at startup`);
+      } else {
+        log(`Using local image: ${image}`);
+      }
     } catch {
       log(`Pulling ${image}...`);
       const pull = await runCommand(runtime, ["pull", image], log);
